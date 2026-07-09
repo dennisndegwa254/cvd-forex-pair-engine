@@ -51,18 +51,33 @@ import requests
 import streamlit as st
 
 # yfinance is an optional dependency for the CVD section. If the deploy
-# environment fails to install it for any reason, the app should degrade
-# gracefully (spot rates + fundamentals still work) instead of crashing on
-# import. This is defense-in-depth on top of fixing the actual packaging
-# issue -- see requirements.txt / runtime.txt notes.
+# environment fails to install it via requirements.txt for any reason, try
+# a one-time runtime install as a fallback before giving up gracefully.
+# This does NOT replace fixing requirements.txt/runtime.txt properly -- it's
+# a safety net so the CVD section can recover on its own if the build step
+# silently skipped the package, without you having to redeploy again.
+YFINANCE_IMPORT_ERROR = None
 try:
     import yfinance as yf
     YFINANCE_AVAILABLE = True
-    YFINANCE_IMPORT_ERROR = None
-except Exception as _yf_err:  # ModuleNotFoundError or anything else at import time
-    yf = None
+except Exception as _yf_err:
     YFINANCE_AVAILABLE = False
     YFINANCE_IMPORT_ERROR = str(_yf_err)
+    try:
+        import subprocess
+        import sys
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "yfinance==0.2.43"]
+        )
+        import yfinance as yf
+        YFINANCE_AVAILABLE = True
+        YFINANCE_IMPORT_ERROR = None
+    except Exception as _retry_err:
+        yf = None
+        YFINANCE_AVAILABLE = False
+        YFINANCE_IMPORT_ERROR = (
+            f"import failed ({_yf_err}); runtime install also failed ({_retry_err})"
+        )
 
 # ==========================================
 # CONFIGURATION
@@ -447,11 +462,13 @@ st.caption(
 
 if not YFINANCE_AVAILABLE:
     st.error(
-        "The CVD section is disabled because the `yfinance` package failed to import: "
-        f"`{YFINANCE_IMPORT_ERROR}`. Spot rates and fundamentals below still work. "
-        "This means the deployment environment does not actually have yfinance "
-        "installed -- see the requirements.txt / runtime.txt fix notes for this repo. "
-        "The rest of the app will keep running instead of crashing."
+        "The CVD section is disabled: `yfinance` could not be imported even after "
+        f"attempting a runtime install. Details: `{YFINANCE_IMPORT_ERROR}`. "
+        "Spot rates and fundamentals below still work. This points to something "
+        "blocking package installs entirely in this environment (e.g. no outbound "
+        "network access during app runtime, or a filesystem permissions issue) "
+        "rather than a simple missing-line-in-requirements.txt problem -- see the "
+        "diagnosis notes for next steps."
     )
 
 tf_tabs = st.tabs(["30m", "1h", "4h", "1d"]) if YFINANCE_AVAILABLE else []
