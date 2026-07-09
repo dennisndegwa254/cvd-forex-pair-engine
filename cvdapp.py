@@ -31,20 +31,37 @@ non-zero volume for the selected pair:
     (each bar contributes +1/-1 rather than +/-volume) and labels this
     clearly in the UI. It never silently fakes volume numbers.
 
-SETUP REQUIRED: this needs a free Twelve Data API key.
-  1. Sign up at https://twelvedata.com (free tier: 800 requests/day, 8/min).
-  2. Copy your API key from the dashboard.
-  3. In Streamlit Cloud: Manage app -> Settings -> Secrets, add:
-         TWELVE_DATA_API_KEY = "your_key_here"
-     (Locally: create .streamlit/secrets.toml with the same line.)
-Without a key configured, the app falls back to Twelve Data's public "demo"
-key, which is heavily rate-limited and may not work reliably -- get your own
-key for anything beyond a quick test.
+SETUP REQUIRED: three free API keys, all added the same way.
+In Streamlit Cloud: Manage app -> Settings -> Secrets. Locally: .streamlit/secrets.toml.
+
+  1. TWELVE_DATA_API_KEY  -- twelvedata.com (free: 800 req/day, 8/min)
+     Powers the CVD price/volume bars. Falls back to a shared, heavily
+     rate-limited "demo" key if not set.
+
+  2. FINNHUB_API_KEY      -- finnhub.io (free: 60 req/min)
+     Powers the live economic calendar (recent releases + upcoming events).
+     Note: the economic-calendar endpoint's free-tier access has shifted over
+     time on Finnhub's side -- if you get a 403, check your Finnhub dashboard's
+     plan/endpoint access page.
+
+  3. ALPHAVANTAGE_API_KEY -- alphavantage.co (free: 25 req/day, 5/min)
+     Powers the news + sentiment feed. This tier is genuinely tight, so that
+     section fetches on a manual button click and caches for 6 hours -- it
+     does NOT auto-refresh with the rest of the page.
+
+Secrets file example:
+    TWELVE_DATA_API_KEY = "..."
+    FINNHUB_API_KEY = "..."
+    ALPHAVANTAGE_API_KEY = "..."
+
+Any of the three can be left unset -- that section will show a clear setup
+message instead of crashing the rest of the app.
 
 DISCLAIMER: This is an analytical/educational tool, not investment advice.
 Nothing here should be treated as a trading signal.
 """
 
+import datetime
 import time
 
 import numpy as np
@@ -83,6 +100,37 @@ def get_td_api_key() -> str:
 
 TD_API_KEY = get_td_api_key()
 USING_DEMO_KEY = TD_API_KEY == "demo"
+
+
+def get_secret(name: str):
+    try:
+        val = st.secrets.get(name, None)
+    except Exception:
+        val = None
+    return val or None
+
+
+FINNHUB_API_KEY = get_secret("FINNHUB_API_KEY")
+ALPHAVANTAGE_API_KEY = get_secret("ALPHAVANTAGE_API_KEY")
+
+# Country codes (as used by Finnhub's economic calendar) relevant to each pair,
+# used to filter the unified calendar feed down to what actually matters for
+# that currency pair instead of showing every country's releases.
+PAIR_COUNTRIES = {
+    "EURUSD": ["EU", "US"],
+    "GBPUSD": ["GB", "US"],
+    "USDJPY": ["US", "JP"],
+    "AUDUSD": ["AU", "US"],
+}
+
+# Alpha Vantage forex tickers (function=NEWS_SENTIMENT accepts FOREX:XXX) per
+# pair's two currencies -- used to pull relevant headlines.
+PAIR_AV_TICKERS = {
+    "EURUSD": "FOREX:EUR,FOREX:USD",
+    "GBPUSD": "FOREX:GBP,FOREX:USD",
+    "USDJPY": "FOREX:USD,FOREX:JPY",
+    "AUDUSD": "FOREX:AUD,FOREX:USD",
+}
 
 # ==========================================
 # FUNDAMENTALS & GEOPOLITICS REFERENCE DATA
@@ -291,6 +339,177 @@ def fetch_spot_rates():
 
 
 # ==========================================
+# LIVE ECONOMIC CALENDAR (scheduled-data tier)
+# Real upcoming/past events instead of a hand-typed date that goes stale the
+# moment a meeting passes. Requires a free Finnhub API key.
+# ==========================================
+CALENDAR_LOOKBACK_DAYS = 14
+CALENDAR_LOOKAHEAD_DAYS = 45
+
+
+@st.cache_data(ttl=1800)  # calendar data doesn't need to refresh every 45s
+def fetch_economic_calendar():
+    """Returns (past_events, future_events, error). Each event is a dict."""
+    if not FINNHUB_API_KEY:
+        return [], [], (
+            "No Finnhub API key configured. Sign up free at finnhub.io, then add "
+            "FINNHUB_API_KEY in your app's Secrets to enable the live calendar."
+        )
+    try:
+        today = datetime.date.today()
+        frm = (today - datetime.timedelta(days=CALENDAR_LOOKBACK_DAYS)).isoformat()
+        to = (today + datetime.timedelta(days=CALENDAR_LOOKAHEAD_DAYS)).isoformat()
+        resp = requests.get(
+            "https://finnhub.io/api/v1/calendar/economic",
+            params={"from": frm, "to": to, "token": FINNHUB_API_KEY},
+            timeout=10,
+        )
+        if resp.status_code == 403:
+            return [], [], (
+                "Finnhub returned 403 (access denied) for the economic calendar "
+                "endpoint -- on some Finnhub account tiers this specific endpoint "
+                "requires a paid plan. Check your Finnhub dashboard's plan/endpoint "
+                "access page to confirm."
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+        events = payload.get("economicCalendar") or payload.get("data") or []
+        if not isinstance(events, list):
+            return [], [], "Unexpected response shape from Finnhub calendar endpoint."
+
+        now = datetime.datetime.utcnow()
+        past, future = [], []
+        for e in events:
+            t_raw = e.get("time")
+            try:
+                t = datetime.datetime.fromisoformat(t_raw.replace("Z", "")) if t_raw else None
+            except Exception:
+                t = None
+            item = {
+                "country": e.get("country", "?"),
+                "event": e.get("event", "Unnamed event"),
+                "impact": e.get("impact", "?"),
+                "actual": e.get("actual"),
+                "estimate": e.get("estimate"),
+                "prev": e.get("prev"),
+                "time": t,
+            }
+            if t is None:
+                continue
+            if t <= now and item["actual"] is not None:
+                past.append(item)
+            elif t > now:
+                future.append(item)
+        past.sort(key=lambda x: x["time"], reverse=True)
+        future.sort(key=lambda x: x["time"])
+        return past, future, None
+    except Exception as e:
+        return [], [], f"{type(e).__name__}: {e}"
+
+
+def filter_calendar_for_pair(past, future, pair, impact_filter=("high", "medium")):
+    countries = PAIR_COUNTRIES.get(pair, [])
+    imp = {i.lower() for i in impact_filter}
+    p = [e for e in past if e["country"] in countries and str(e["impact"]).lower() in imp]
+    f = [e for e in future if e["country"] in countries and str(e["impact"]).lower() in imp]
+    return p, f
+
+
+# ==========================================
+# NEWS + SENTIMENT (Alpha Vantage) -- free tier is only 25 requests/day,
+# so this is cached for hours and fetched on-demand, not on every rerun.
+# ==========================================
+@st.cache_data(ttl=6 * 3600)
+def fetch_news_sentiment(pair: str):
+    """Returns (list_of_articles, error)."""
+    if not ALPHAVANTAGE_API_KEY:
+        return [], (
+            "No Alpha Vantage API key configured. Sign up free at alphavantage.co, "
+            "then add ALPHAVANTAGE_API_KEY in your app's Secrets. Note: free tier is "
+            "only 25 requests/day, so this section refreshes every 6 hours, not live."
+        )
+    try:
+        resp = requests.get(
+            "https://www.alphavantage.co/query",
+            params={
+                "function": "NEWS_SENTIMENT",
+                "tickers": PAIR_AV_TICKERS.get(pair, ""),
+                "limit": 8,
+                "apikey": ALPHAVANTAGE_API_KEY,
+            },
+            timeout=10,
+        )
+        payload = resp.json()
+        if "Note" in payload or "Information" in payload:
+            return [], (
+                "Alpha Vantage quota message: "
+                f"{payload.get('Note') or payload.get('Information')}"
+            )
+        feed = payload.get("feed", [])
+        articles = []
+        for item in feed[:8]:
+            articles.append({
+                "title": item.get("title", "Untitled"),
+                "source": item.get("source", "Unknown source"),
+                "url": item.get("url", ""),
+                "time_published": item.get("time_published", ""),
+                "summary": item.get("summary", ""),
+                "sentiment_score": item.get("overall_sentiment_score"),
+                "sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+            })
+        return articles, None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
+
+
+# ==========================================
+# FRESHNESS + "WHAT CHANGED" DELTA TRACKING
+# Session-scoped: compares against a baseline snapshot taken when this browser
+# session started, so you can see what moved since you opened the dashboard.
+# This does NOT persist across app restarts/new sessions -- it's a live-session
+# diff, not a permanent history log.
+# ==========================================
+def freshness_badge(as_of: datetime.datetime, warn_hours=24, stale_hours=168):
+    age_hours = (datetime.datetime.utcnow() - as_of).total_seconds() / 3600
+    if age_hours < warn_hours:
+        return f"🟢 fetched {age_hours:.0f}h ago"
+    elif age_hours < stale_hours:
+        return f"🟡 fetched {age_hours / 24:.0f}d ago -- verify before relying on this"
+    else:
+        return f"🔴 fetched {age_hours / 24:.0f}d ago -- stale, needs refresh"
+
+
+def narrative_freshness_badge(verified_as_of_str: str):
+    verified = datetime.datetime.strptime(verified_as_of_str, "%Y-%m-%d")
+    age_days = (datetime.datetime.utcnow() - verified).days
+    if age_days < 14:
+        return f"🟢 analyst narrative reviewed {age_days}d ago"
+    elif age_days < 45:
+        return f"🟡 analyst narrative reviewed {age_days}d ago -- due for re-review"
+    else:
+        return f"🔴 analyst narrative reviewed {age_days}d ago -- stale, re-verify before use"
+
+
+def get_delta_baseline(pair: str, current_snapshot: dict):
+    """
+    Compares current_snapshot against the snapshot stored at the start of this
+    browser session for this pair, records changes, and returns them without
+    ever overwriting the original baseline mid-session (so deltas accumulate
+    against "since you opened this session," not "since the last 45s refresh").
+    """
+    key = f"_baseline_{pair}"
+    if key not in st.session_state:
+        st.session_state[key] = current_snapshot
+        return []
+    baseline = st.session_state[key]
+    changes = []
+    for k, v in current_snapshot.items():
+        if k in baseline and baseline[k] != v and v is not None:
+            changes.append(f"**{k}** changed: `{baseline[k]}` → `{v}`")
+    return changes
+
+
+# ==========================================
 # CVD ENGINE (Twelve Data OHLCV)
 # ==========================================
 @st.cache_data(ttl=REFRESH_SECONDS)
@@ -449,6 +668,11 @@ with st.sidebar:
     st.markdown(f"**CVD data source:** Twelve Data -- `{td_symbol}`")
     st.markdown("**Spot rate source:** open.er-api.com (rate snapshot, not tick data)")
     st.markdown(f"**Refresh interval:** {REFRESH_SECONDS}s")
+    st.write("---")
+    st.markdown("**API key status**")
+    st.markdown(f"{'🟢' if not USING_DEMO_KEY else '🟡'} Twelve Data: {'configured' if not USING_DEMO_KEY else 'using shared demo key'}")
+    st.markdown(f"{'🟢' if FINNHUB_API_KEY else '🔴'} Finnhub (calendar): {'configured' if FINNHUB_API_KEY else 'not set'}")
+    st.markdown(f"{'🟢' if ALPHAVANTAGE_API_KEY else '🔴'} Alpha Vantage (news): {'configured' if ALPHAVANTAGE_API_KEY else 'not set'}")
 
 spot = fetch_spot_rates()
 col1, col2 = st.columns([1, 2])
@@ -507,9 +731,70 @@ st.info(CROSS_CUTTING_THEME)
 
 m = MACRO_INTELLIGENCE_MATRIX[selected_pair]
 
+# --- Tier 1: live scheduled-data (economic calendar) ---
+st.markdown("### 📅 Live Economic Calendar")
+past_events, future_events, cal_err = fetch_economic_calendar()
+if cal_err:
+    st.warning(cal_err)
+else:
+    p_events, f_events = filter_calendar_for_pair(past_events, future_events, selected_pair)
+
+    snapshot = {}
+    if p_events:
+        latest = p_events[0]
+        snapshot["last_actual"] = f"{latest['country']} {latest['event']}: {latest['actual']}"
+    if f_events:
+        nxt = f_events[0]
+        snapshot["next_event"] = f"{nxt['country']} {nxt['event']} @ {nxt['time']}"
+    changes = get_delta_baseline(selected_pair, snapshot)
+
+    cal_col1, cal_col2 = st.columns(2)
+    with cal_col1:
+        st.markdown("**Recent releases (actual vs. estimate)**")
+        if p_events:
+            for e in p_events[:5]:
+                surprise = ""
+                try:
+                    if e["actual"] is not None and e["estimate"] is not None:
+                        diff = float(e["actual"]) - float(e["estimate"])
+                        surprise = " 🔺 beat" if diff > 0 else (" 🔻 miss" if diff < 0 else " ➖ in-line")
+                except Exception:
+                    pass
+                st.markdown(
+                    f"- `{e['time'].strftime('%Y-%m-%d')}` **{e['country']}** {e['event']}: "
+                    f"actual **{e['actual']}** vs est. {e['estimate']}{surprise}"
+                )
+        else:
+            st.caption("No recent high/medium-impact releases found for this pair's countries.")
+    with cal_col2:
+        st.markdown("**Upcoming events (next binary risk)**")
+        if f_events:
+            for e in f_events[:5]:
+                days_out = (e["time"] - datetime.datetime.utcnow()).days
+                st.markdown(
+                    f"- in **{max(days_out, 0)}d** ({e['time'].strftime('%Y-%m-%d')}) "
+                    f"**{e['country']}** {e['event']} -- prior: {e['prev']}, est.: {e['estimate']}"
+                )
+        else:
+            st.caption("No upcoming high/medium-impact events found in the next 45 days.")
+
+    if changes:
+        st.success("🔄 **Changed since you opened this session:**\n\n" + "\n".join(f"- {c}" for c in changes))
+
+st.caption(
+    "Source: Finnhub economic calendar, filtered to high/medium-impact releases for "
+    "this pair's two currencies. This is genuinely live -- refetched every 30 minutes."
+)
+
+st.write("---")
+
+# --- Tier 2: judgment / analyst narrative (static, human-reviewed) ---
+st.markdown("### 🧭 Analyst Read: Stance, Bias & Risk")
+st.caption(narrative_freshness_badge(FUNDAMENTALS_VERIFIED_AS_OF))
+
 fcol1, fcol2 = st.columns(2)
 with fcol1:
-    st.markdown(f"### {m['central_bank']}")
+    st.markdown(f"#### {m['central_bank']}")
     st.markdown(f"**Policy rate:** {m['policy_rate']}")
     st.markdown(f"**Stance:** {m['policy_stance']}")
     st.markdown(f"_{m['stance_detail']}_")
@@ -542,6 +827,37 @@ st.caption(
     "Reserve, BoJ and RBA primary releases. Central bank stances change after every "
     "meeting -- re-verify before relying on this for a live decision."
 )
+
+st.write("---")
+
+# --- Tier 3: news + sentiment ---
+st.markdown("### 📰 News & Sentiment")
+news_key = f"_news_{selected_pair}"
+if st.button("Fetch latest headlines", key=f"btn_{news_key}"):
+    st.session_state[news_key] = fetch_news_sentiment(selected_pair)
+
+if news_key not in st.session_state:
+    st.caption(
+        "Not fetched yet this session -- click the button above. This is manual rather "
+        "than auto-refreshing because the free Alpha Vantage tier is limited to 25 "
+        "requests/day; auto-refreshing every 45s would burn through that in under 20 minutes."
+    )
+else:
+    articles, news_err = st.session_state[news_key]
+    if news_err:
+        st.warning(news_err)
+    elif not articles:
+        st.caption("No recent articles returned for this pair's currencies.")
+    else:
+        for a in articles:
+            score = a["sentiment_score"]
+            label = a["sentiment_label"]
+            emoji = "🟢" if "Bullish" in label else ("🔴" if "Bearish" in label else "⚪")
+            st.markdown(
+                f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} "
+                f"({a['time_published'][:8]})"
+            )
+            st.caption(f"Sentiment: {label} ({score}) -- {a['summary'][:180]}{'...' if len(a['summary']) > 180 else ''}")
 
 st.write("---")
 st.caption(
