@@ -72,7 +72,7 @@ except Exception as _yf_err:
             [
                 sys.executable, "-m", "pip", "install", "--quiet",
                 "--target", _fallback_dir,
-                "yfinance==0.2.43",
+                "yfinance==0.2.43", "curl_cffi==0.7.4",
             ]
         )
         if _fallback_dir not in sys.path:
@@ -324,22 +324,44 @@ def fetch_spot_rates():
 # ==========================================
 # CVD PROXY ENGINE (built on real futures OHLCV)
 # ==========================================
-@st.cache_data(ttl=REFRESH_SECONDS)
-def fetch_futures_bars(ticker: str, interval: str, period: str):
-    if not YFINANCE_AVAILABLE:
-        return None
+def _get_yf_session():
+    """
+    Yahoo Finance increasingly blocks/rate-limits plain requests from cloud
+    datacenter IPs (exactly what Streamlit Community Cloud runs on). Using
+    curl_cffi to impersonate a real browser's TLS fingerprint is the standard
+    mitigation. Falls back to no custom session if curl_cffi isn't installed.
+    """
     try:
-        df = yf.download(
-            ticker, interval=interval, period=period,
-            progress=False, auto_adjust=False,
-        )
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        from curl_cffi import requests as curl_requests
+        return curl_requests.Session(impersonate="chrome")
     except Exception:
         return None
+
+
+_YF_SESSION = _get_yf_session() if YFINANCE_AVAILABLE else None
+
+
+@st.cache_data(ttl=REFRESH_SECONDS)
+def fetch_futures_bars(ticker: str, interval: str, period: str):
+    """Returns (dataframe_or_None, error_message_or_None)."""
+    if not YFINANCE_AVAILABLE:
+        return None, "yfinance not available"
+    try:
+        kwargs = dict(interval=interval, period=period, progress=False, auto_adjust=False)
+        if _YF_SESSION is not None:
+            kwargs["session"] = _YF_SESSION
+        df = yf.download(ticker, **kwargs)
+        if df is None or df.empty:
+            return None, (
+                "Yahoo Finance returned no rows for this ticker/interval/period. "
+                "On cloud-hosted apps this is most often Yahoo rate-limiting or "
+                "blocking requests from datacenter IP ranges, not a code error."
+            )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def resample_bars(df: pd.DataFrame, rule: str):
@@ -405,20 +427,23 @@ def summarize_cvd(d: pd.DataFrame, lookback_bars: int = 8):
 @st.cache_data(ttl=REFRESH_SECONDS)
 def build_all_timeframe_cvd(ticker: str):
     results = {}
+    errors = {}
     raw_cache = {}
     for tf in TIMEFRAMES:
         plan = _FETCH_PLAN[tf]
         base_key = (plan["interval"], plan["period"])
         if base_key not in raw_cache:
             raw_cache[base_key] = fetch_futures_bars(ticker, plan["interval"], plan["period"])
-        base_df = raw_cache[base_key]
+        base_df, base_err = raw_cache[base_key]
         if base_df is None:
             results[tf] = None
+            errors[tf] = base_err
             continue
         working_df = resample_bars(base_df, plan["resample"]) if plan["resample"] else base_df
         cvd_df = compute_cvd_proxy(working_df)
         results[tf] = cvd_df
-    return results
+        errors[tf] = None if cvd_df is not None else "Not enough bars to compute ATR/CVD yet."
+    return results, errors
 
 
 # ==========================================
@@ -480,7 +505,7 @@ if not YFINANCE_AVAILABLE:
     )
 
 tf_tabs = st.tabs(["30m", "1h", "4h", "1d"]) if YFINANCE_AVAILABLE else []
-all_cvd = build_all_timeframe_cvd(ticker) if YFINANCE_AVAILABLE else {}
+all_cvd, all_errors = build_all_timeframe_cvd(ticker) if YFINANCE_AVAILABLE else ({}, {})
 
 for tf, tab in zip(TIMEFRAMES, tf_tabs):
     with tab:
@@ -488,9 +513,9 @@ for tf, tab in zip(TIMEFRAMES, tf_tabs):
         d = compute_cvd_proxy(raw, noise_atr_fraction=noise_pct / 100.0) if raw is not None else None
         if d is None or d.empty:
             st.warning(
-                f"No {tf} futures data available right now (market closed, rate-limited, "
-                "or ticker unavailable). Not substituting synthetic data -- showing nothing "
-                "is more honest than showing a guess."
+                f"No {tf} futures data available right now. Not substituting synthetic "
+                f"data -- showing nothing is more honest than showing a guess.\n\n"
+                f"**Reason:** {all_errors.get(tf, 'unknown')}"
             )
             continue
 
