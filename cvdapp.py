@@ -50,12 +50,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# yfinance is an optional dependency for the CVD section. If the deploy
-# environment fails to install it via requirements.txt for any reason, try
-# a one-time runtime install as a fallback before giving up gracefully.
-# This does NOT replace fixing requirements.txt/runtime.txt properly -- it's
-# a safety net so the CVD section can recover on its own if the build step
-# silently skipped the package, without you having to redeploy again.
+# yfinance is an optional dependency for the CVD section. Some hosting
+# environments (Streamlit Community Cloud included) make the main
+# site-packages directory READ-ONLY at runtime after the build step
+# finishes -- so a plain `pip install` attempted from inside the running
+# app has nowhere to write and fails with a generic exit status 1, even
+# though the package is fetchable. The fix: install into a writable /tmp
+# directory instead, and add that directory to sys.path.
 YFINANCE_IMPORT_ERROR = None
 try:
     import yfinance as yf
@@ -66,9 +67,16 @@ except Exception as _yf_err:
     try:
         import subprocess
         import sys
+        _fallback_dir = "/tmp/_yfinance_runtime_fallback"
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", "yfinance==0.2.43"]
+            [
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "--target", _fallback_dir,
+                "yfinance==0.2.43",
+            ]
         )
+        if _fallback_dir not in sys.path:
+            sys.path.insert(0, _fallback_dir)
         import yfinance as yf
         YFINANCE_AVAILABLE = True
         YFINANCE_IMPORT_ERROR = None
@@ -76,7 +84,7 @@ except Exception as _yf_err:
         yf = None
         YFINANCE_AVAILABLE = False
         YFINANCE_IMPORT_ERROR = (
-            f"import failed ({_yf_err}); runtime install also failed ({_retry_err})"
+            f"import failed ({_yf_err}); /tmp runtime install also failed ({_retry_err})"
         )
 
 # ==========================================
