@@ -49,7 +49,20 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
+
+# yfinance is an optional dependency for the CVD section. If the deploy
+# environment fails to install it for any reason, the app should degrade
+# gracefully (spot rates + fundamentals still work) instead of crashing on
+# import. This is defense-in-depth on top of fixing the actual packaging
+# issue -- see requirements.txt / runtime.txt notes.
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+    YFINANCE_IMPORT_ERROR = None
+except Exception as _yf_err:  # ModuleNotFoundError or anything else at import time
+    yf = None
+    YFINANCE_AVAILABLE = False
+    YFINANCE_IMPORT_ERROR = str(_yf_err)
 
 # ==========================================
 # CONFIGURATION
@@ -290,6 +303,8 @@ def fetch_spot_rates():
 # ==========================================
 @st.cache_data(ttl=REFRESH_SECONDS)
 def fetch_futures_bars(ticker: str, interval: str, period: str):
+    if not YFINANCE_AVAILABLE:
+        return None
     try:
         df = yf.download(
             ticker, interval=interval, period=period,
@@ -430,8 +445,17 @@ st.caption(
     "from the cumulative sum rather than allowed to whipsaw it."
 )
 
-tf_tabs = st.tabs(["30m", "1h", "4h", "1d"])
-all_cvd = build_all_timeframe_cvd(ticker)
+if not YFINANCE_AVAILABLE:
+    st.error(
+        "The CVD section is disabled because the `yfinance` package failed to import: "
+        f"`{YFINANCE_IMPORT_ERROR}`. Spot rates and fundamentals below still work. "
+        "This means the deployment environment does not actually have yfinance "
+        "installed -- see the requirements.txt / runtime.txt fix notes for this repo. "
+        "The rest of the app will keep running instead of crashing."
+    )
+
+tf_tabs = st.tabs(["30m", "1h", "4h", "1d"]) if YFINANCE_AVAILABLE else []
+all_cvd = build_all_timeframe_cvd(ticker) if YFINANCE_AVAILABLE else {}
 
 for tf, tab in zip(TIMEFRAMES, tf_tabs):
     with tab:
