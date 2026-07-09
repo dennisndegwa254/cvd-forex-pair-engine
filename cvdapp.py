@@ -108,7 +108,7 @@ TIMEFRAMES = ["30m", "1h", "4h", "1d"]
 # 4h is built by resampling 1h bars (yfinance has no native 4h interval).
 _FETCH_PLAN = {
     "30m": {"interval": "30m", "period": "5d", "resample": None},
-    "1h": {"interval": "60m", "period": "1mo", "resample": None},
+    "1h": {"interval": "60m", "period": "3mo", "resample": None},
     "4h": {"interval": "60m", "period": "3mo", "resample": "4h"},
     "1d": {"interval": "1d", "period": "1y", "resample": None},
 }
@@ -343,25 +343,42 @@ _YF_SESSION = _get_yf_session() if YFINANCE_AVAILABLE else None
 
 @st.cache_data(ttl=REFRESH_SECONDS)
 def fetch_futures_bars(ticker: str, interval: str, period: str):
-    """Returns (dataframe_or_None, error_message_or_None)."""
+    """
+    Returns (dataframe_or_None, error_message_or_None).
+
+    Retries with backoff on empty/failed responses, since Yahoo's rate
+    limiter is usually short-window: a call that gets blocked often
+    succeeds a couple of seconds later rather than being a hard, permanent
+    block. Every attempt is logged so the final error message reflects
+    what actually happened rather than just the last attempt.
+    """
     if not YFINANCE_AVAILABLE:
         return None, "yfinance not available"
-    try:
-        kwargs = dict(interval=interval, period=period, progress=False, auto_adjust=False)
-        if _YF_SESSION is not None:
-            kwargs["session"] = _YF_SESSION
-        df = yf.download(ticker, **kwargs)
-        if df is None or df.empty:
-            return None, (
-                "Yahoo Finance returned no rows for this ticker/interval/period. "
-                "On cloud-hosted apps this is most often Yahoo rate-limiting or "
-                "blocking requests from datacenter IP ranges, not a code error."
-            )
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+
+    attempts = []
+    for attempt_num, delay in enumerate([0, 3, 7], start=1):
+        if delay:
+            time.sleep(delay)
+        try:
+            kwargs = dict(interval=interval, period=period, progress=False, auto_adjust=False)
+            if _YF_SESSION is not None:
+                kwargs["session"] = _YF_SESSION
+            df = yf.download(ticker, **kwargs)
+            if df is None or df.empty:
+                attempts.append(f"attempt {attempt_num}: empty response")
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
+        except Exception as e:
+            attempts.append(f"attempt {attempt_num}: {type(e).__name__}: {e}")
+
+    return None, (
+        "Yahoo Finance returned no usable data after 3 attempts with backoff "
+        f"({'; '.join(attempts)}). This points to a sustained block/rate-limit on "
+        "this ticker from this IP rather than a one-off blip -- if this persists "
+        "across reloads, the data source needs to change (see notes)."
+    )
 
 
 def resample_bars(df: pd.DataFrame, rule: str):
@@ -433,6 +450,8 @@ def build_all_timeframe_cvd(ticker: str):
         plan = _FETCH_PLAN[tf]
         base_key = (plan["interval"], plan["period"])
         if base_key not in raw_cache:
+            if raw_cache:
+                time.sleep(1.5)  # stagger distinct Yahoo calls to avoid tripping rate limits
             raw_cache[base_key] = fetch_futures_bars(ticker, plan["interval"], plan["period"])
         base_df, base_err = raw_cache[base_key]
         if base_df is None:
