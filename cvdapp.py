@@ -1,48 +1,50 @@
 """
 FX Macro & Order-Flow Dashboard
 ================================
-Rebuilt version of the original script.
 
-WHAT CHANGED AND WHY (read this before trusting the numbers):
+DATA SOURCE HISTORY (read this -- it explains why the code looks like this):
 
-1. CVD (Cumulative Volume Delta) was previously 100% fabricated: it was a random
-   direction multiplied by a made-up "simulated_vol" constant. That is not order
-   flow, it's noise wearing a costume. Spot FX is an OTC market with no
-   consolidated tape, so there is no free, legitimate source of true tick-level
-   buy/sell volume for EURUSD, GBPUSD, USDJPY, or AUDUSD.
+v1 used a random-number "CVD" -- fabricated, not real data. Replaced.
+v2 used yfinance (Yahoo Finance) pulling CME currency futures as a real-volume
+   proxy for spot FX. This worked locally but failed in production: Yahoo
+   blocks/rate-limits requests from cloud datacenter IPs (exactly what
+   Streamlit Community Cloud runs on), confirmed by repeated empty responses
+   even after retries, backoff, request staggering, and browser-impersonation
+   via curl_cffi. That is a platform-level block, not something more code
+   can patch around.
+v3 (this version) uses Twelve Data (twelvedata.com) -- a real, key-based
+   market-data API designed for exactly this kind of cloud/programmatic
+   access, instead of an unofficial scraped feed. It queries the actual
+   currency pair directly at native 30min/1h/4h/1day intervals (Twelve Data
+   supports 4h natively, so no more manual resampling either).
 
-   The fix used here: CME-listed currency FUTURES (6E, 6B, 6J, 6A) DO have real,
-   exchange-reported volume. This script pulls real OHLCV bars for those futures
-   from Yahoo Finance and derives an industry-standard "bar-based CVD proxy":
-   each bar's volume is signed +/- based on whether it closed up or down, then
-   accumulated. This is a genuine, widely-used institutional approximation when
-   true tick data isn't available -- but it IS still an approximation of spot
-   CVD via a correlated futures market, not the real thing. That distinction is
-   shown in the UI, not hidden.
+IMPORTANT HONESTY NOTE ON VOLUME: spot FX is OTC and has no single
+consolidated tape, so "volume" from ANY forex data provider (including
+Twelve Data) is that provider's own aggregated liquidity/tick activity, not
+a universal exchange-reported number -- the same caveat applies to every
+retail forex platform's volume indicator (e.g. MT4/MT5 "tick volume").
+This script detects at runtime whether the feed is actually returning
+non-zero volume for the selected pair:
+  - If real volume is present: CVD = cumulative SUM OF SIGNED VOLUME per bar.
+  - If volume is zero/missing for every bar (happens on some free-tier forex
+    feeds): the app automatically falls back to a tick-direction proxy
+    (each bar contributes +1/-1 rather than +/-volume) and labels this
+    clearly in the UI. It never silently fakes volume numbers.
 
-2. "Filtering the noise" is implemented as: (a) classifying bars by direction
-   using the bar's own OHLC rather than random ticks, (b) suppressing the signed
-   volume contribution of any bar whose range is below a rolling
-   noise threshold (a fraction of 14-period ATR for that timeframe) -- i.e.
-   indecisive/chop bars don't get to whipsaw the cumulative line.
-
-3. The fundamentals/geopolitics section previously had static numbers dressed
-   up as "live intelligence." They're now clearly labeled reference data with
-   a verified-as-of date, and each entry has real current policy context
-   (verified via web search at the time this file was built), plus indication,
-   bias, invalidation risk, and near/long-term impact fields. YOU STILL NEED
-   TO REFRESH THESE PERIODICALLY -- central bank stances shift after every
-   meeting. This is not a live feed.
-
-4. Removed the fake "1.5 Hz institutional TLS stream" language. The refresh
-   loop is now honestly labeled and throttled to reduce API load.
+SETUP REQUIRED: this needs a free Twelve Data API key.
+  1. Sign up at https://twelvedata.com (free tier: 800 requests/day, 8/min).
+  2. Copy your API key from the dashboard.
+  3. In Streamlit Cloud: Manage app -> Settings -> Secrets, add:
+         TWELVE_DATA_API_KEY = "your_key_here"
+     (Locally: create .streamlit/secrets.toml with the same line.)
+Without a key configured, the app falls back to Twelve Data's public "demo"
+key, which is heavily rate-limited and may not work reliably -- get your own
+key for anything beyond a quick test.
 
 DISCLAIMER: This is an analytical/educational tool, not investment advice.
-Futures-volume-derived CVD proxies and reference macro notes are inputs to
-your own analysis, not trading signals. Verify anything you intend to trade on.
+Nothing here should be treated as a trading signal.
 """
 
-import datetime
 import time
 
 import numpy as np
@@ -50,70 +52,37 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# yfinance is an optional dependency for the CVD section. Some hosting
-# environments (Streamlit Community Cloud included) make the main
-# site-packages directory READ-ONLY at runtime after the build step
-# finishes -- so a plain `pip install` attempted from inside the running
-# app has nowhere to write and fails with a generic exit status 1, even
-# though the package is fetchable. The fix: install into a writable /tmp
-# directory instead, and add that directory to sys.path.
-YFINANCE_IMPORT_ERROR = None
-try:
-    import yfinance as yf
-    YFINANCE_AVAILABLE = True
-except Exception as _yf_err:
-    YFINANCE_AVAILABLE = False
-    YFINANCE_IMPORT_ERROR = str(_yf_err)
-    try:
-        import subprocess
-        import sys
-        _fallback_dir = "/tmp/_yfinance_runtime_fallback"
-        subprocess.check_call(
-            [
-                sys.executable, "-m", "pip", "install", "--quiet",
-                "--target", _fallback_dir,
-                "yfinance==0.2.43", "curl_cffi==0.7.4",
-            ]
-        )
-        if _fallback_dir not in sys.path:
-            sys.path.insert(0, _fallback_dir)
-        import yfinance as yf
-        YFINANCE_AVAILABLE = True
-        YFINANCE_IMPORT_ERROR = None
-    except Exception as _retry_err:
-        yf = None
-        YFINANCE_AVAILABLE = False
-        YFINANCE_IMPORT_ERROR = (
-            f"import failed ({_yf_err}); /tmp runtime install also failed ({_retry_err})"
-        )
-
 # ==========================================
 # CONFIGURATION
 # ==========================================
 MAJOR_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
 
-# CME currency futures used as a REAL-VOLUME proxy for each spot pair.
-# (Spot FX itself has no consolidated volume; these are the closest
-# transparent, exchange-reported venues tracking the same currency.)
-FUTURES_PROXY = {
-    "EURUSD": ("6E=F", "CME Euro FX futures"),
-    "GBPUSD": ("6B=F", "CME British Pound futures"),
-    "USDJPY": ("6J=F", "CME Japanese Yen futures (inverse-quoted vs USDJPY)"),
-    "AUDUSD": ("6A=F", "CME Australian Dollar futures"),
+TD_SYMBOLS = {
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD",
 }
 
+# Twelve Data supports these natively -- no resampling required.
 TIMEFRAMES = ["30m", "1h", "4h", "1d"]
+_TD_INTERVAL = {"30m": "30min", "1h": "1h", "4h": "4h", "1d": "1day"}
+_TD_OUTPUTSIZE = {"30m": 200, "1h": 200, "4h": 200, "1d": 260}
 
-# yfinance native intervals + lookback needed to build each requested timeframe.
-# 4h is built by resampling 1h bars (yfinance has no native 4h interval).
-_FETCH_PLAN = {
-    "30m": {"interval": "30m", "period": "5d", "resample": None},
-    "1h": {"interval": "60m", "period": "3mo", "resample": None},
-    "4h": {"interval": "60m", "period": "3mo", "resample": "4h"},
-    "1d": {"interval": "1d", "period": "1y", "resample": None},
-}
+REFRESH_SECONDS = 45
+TD_BASE_URL = "https://api.twelvedata.com/time_series"
 
-REFRESH_SECONDS = 30  # real OHLCV bars don't move meaningfully faster than this
+
+def get_td_api_key() -> str:
+    try:
+        key = st.secrets.get("TWELVE_DATA_API_KEY", None)
+    except Exception:
+        key = None
+    return key or "demo"
+
+
+TD_API_KEY = get_td_api_key()
+USING_DEMO_KEY = TD_API_KEY == "demo"
 
 # ==========================================
 # FUNDAMENTALS & GEOPOLITICS REFERENCE DATA
@@ -293,7 +262,7 @@ CROSS_CUTTING_THEME = (
 
 
 # ==========================================
-# LIVE SPOT RATE (genuine, but a rate snapshot -- not tick/volume data)
+# LIVE SPOT RATE (rate snapshot, not tick/volume data)
 # ==========================================
 @st.cache_data(ttl=REFRESH_SECONDS)
 def fetch_spot_rates():
@@ -322,83 +291,68 @@ def fetch_spot_rates():
 
 
 # ==========================================
-# CVD PROXY ENGINE (built on real futures OHLCV)
+# CVD ENGINE (Twelve Data OHLCV)
 # ==========================================
-def _get_yf_session():
-    """
-    Yahoo Finance increasingly blocks/rate-limits plain requests from cloud
-    datacenter IPs (exactly what Streamlit Community Cloud runs on). Using
-    curl_cffi to impersonate a real browser's TLS fingerprint is the standard
-    mitigation. Falls back to no custom session if curl_cffi isn't installed.
-    """
-    try:
-        from curl_cffi import requests as curl_requests
-        return curl_requests.Session(impersonate="chrome")
-    except Exception:
-        return None
-
-
-_YF_SESSION = _get_yf_session() if YFINANCE_AVAILABLE else None
-
-
 @st.cache_data(ttl=REFRESH_SECONDS)
-def fetch_futures_bars(ticker: str, interval: str, period: str):
-    """
-    Returns (dataframe_or_None, error_message_or_None).
+def fetch_td_bars(symbol: str, interval: str, outputsize: int):
+    """Returns (dataframe_or_None, error_message_or_None)."""
+    try:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": TD_API_KEY,
+            "order": "ASC",
+        }
+        resp = requests.get(TD_BASE_URL, params=params, timeout=10)
+        payload = resp.json()
 
-    Retries with backoff on empty/failed responses, since Yahoo's rate
-    limiter is usually short-window: a call that gets blocked often
-    succeeds a couple of seconds later rather than being a hard, permanent
-    block. Every attempt is logged so the final error message reflects
-    what actually happened rather than just the last attempt.
-    """
-    if not YFINANCE_AVAILABLE:
-        return None, "yfinance not available"
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            code = payload.get("code", resp.status_code)
+            msg = payload.get("message", "unknown error")
+            if code == 429:
+                return None, (
+                    f"Rate limited by Twelve Data (HTTP 429): {msg}. "
+                    + ("You're on the shared demo key -- get your own free key at "
+                       "twelvedata.com and add it as TWELVE_DATA_API_KEY in your app's "
+                       "Secrets." if USING_DEMO_KEY else
+                       "Free-tier limit is 8 requests/minute / 800/day -- reduce "
+                       "refresh frequency or upgrade the plan.")
+                )
+            if code == 401:
+                return None, f"Invalid API key (HTTP 401): {msg}. Check TWELVE_DATA_API_KEY in Secrets."
+            return None, f"Twelve Data error ({code}): {msg}"
 
-    attempts = []
-    for attempt_num, delay in enumerate([0, 3, 7], start=1):
-        if delay:
-            time.sleep(delay)
-        try:
-            kwargs = dict(interval=interval, period=period, progress=False, auto_adjust=False)
-            if _YF_SESSION is not None:
-                kwargs["session"] = _YF_SESSION
-            df = yf.download(ticker, **kwargs)
-            if df is None or df.empty:
-                attempts.append(f"attempt {attempt_num}: empty response")
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            return df[["Open", "High", "Low", "Close", "Volume"]].dropna(), None
-        except Exception as e:
-            attempts.append(f"attempt {attempt_num}: {type(e).__name__}: {e}")
+        values = payload.get("values") if isinstance(payload, dict) else None
+        if not values:
+            return None, "Twelve Data returned no bars for this symbol/interval."
 
-    return None, (
-        "Yahoo Finance returned no usable data after 3 attempts with backoff "
-        f"({'; '.join(attempts)}). This points to a sustained block/rate-limit on "
-        "this ticker from this IP rather than a one-off blip -- if this persists "
-        "across reloads, the data source needs to change (see notes)."
-    )
-
-
-def resample_bars(df: pd.DataFrame, rule: str):
-    if df is None or df.empty:
-        return None
-    agg = df.resample(rule).agg(
-        {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-    ).dropna()
-    return agg
+        df = pd.DataFrame(values)
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            else:
+                df[col] = 0.0
+        df = df.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                                 "close": "Close", "volume": "Volume"})
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Open", "High", "Low", "Close"])
+        df["Volume"] = df["Volume"].fillna(0.0)
+        return df, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
 def compute_cvd_proxy(df: pd.DataFrame, noise_atr_fraction: float = 0.15, atr_period: int = 14):
     """
-    Bar-based Cumulative Volume Delta proxy, computed on real exchange volume:
-      - direction: +1 if close > open, -1 if close < open, 0 if flat (doji)
-      - noise filter: bars whose (high-low) range is below
-        noise_atr_fraction * rolling ATR contribute ZERO signed volume --
-        these are low-conviction/chop bars that would otherwise whipsaw the
-        cumulative line without a real directional trade behind them.
-    Returns the dataframe with added columns: range, atr, direction, signed_vol, cvd
+    Cumulative Volume Delta. Auto-detects whether the feed actually provides
+    non-zero volume for this symbol:
+      - Real volume present -> CVD = cumulative sum of signed volume per bar.
+      - Volume entirely zero/missing -> falls back to a tick-direction proxy
+        (each bar contributes +1/-1), clearly flagged via 'volume_mode'.
+    Noise filter: bars whose (high-low) range is below noise_atr_fraction *
+    rolling ATR are zeroed out of the cumulative line (chop suppression).
     """
     if df is None or len(df) < atr_period + 2:
         return None
@@ -408,16 +362,19 @@ def compute_cvd_proxy(df: pd.DataFrame, noise_atr_fraction: float = 0.15, atr_pe
     d["atr"] = d["range"].rolling(atr_period, min_periods=1).mean()
     d["direction"] = np.sign(d["Close"] - d["Open"])
 
+    has_real_volume = d["Volume"].abs().sum() > 0
+    magnitude = d["Volume"] if has_real_volume else pd.Series(1.0, index=d.index)
+
     noise_mask = d["range"] < (noise_atr_fraction * d["atr"])
-    signed_vol = d["direction"] * d["Volume"]
-    signed_vol[noise_mask] = 0.0
-    d["signed_vol"] = signed_vol
+    signed = d["direction"] * magnitude
+    signed[noise_mask] = 0.0
+    d["signed_vol"] = signed
     d["cvd"] = d["signed_vol"].cumsum()
+    d.attrs["volume_mode"] = "volume-weighted" if has_real_volume else "tick-direction proxy"
     return d
 
 
 def summarize_cvd(d: pd.DataFrame, lookback_bars: int = 8):
-    """Latest CVD reading + short-term slope-based bias label."""
     if d is None or d.empty:
         return None
     latest_cvd = float(d["cvd"].iloc[-1])
@@ -426,9 +383,9 @@ def summarize_cvd(d: pd.DataFrame, lookback_bars: int = 8):
     filtered_pct = float((d["signed_vol"] == 0).mean() * 100)
 
     if slope > 0:
-        bias = "Bullish (buy-side volume dominant)"
+        bias = "Bullish (buy-side dominant)"
     elif slope < 0:
-        bias = "Bearish (sell-side volume dominant)"
+        bias = "Bearish (sell-side dominant)"
     else:
         bias = "Flat / balanced"
 
@@ -438,30 +395,23 @@ def summarize_cvd(d: pd.DataFrame, lookback_bars: int = 8):
         "bias": bias,
         "filtered_pct": filtered_pct,
         "bars_used": len(d),
+        "volume_mode": d.attrs.get("volume_mode", "unknown"),
     }
 
 
-@st.cache_data(ttl=REFRESH_SECONDS)
-def build_all_timeframe_cvd(ticker: str):
-    results = {}
-    errors = {}
-    raw_cache = {}
-    for tf in TIMEFRAMES:
-        plan = _FETCH_PLAN[tf]
-        base_key = (plan["interval"], plan["period"])
-        if base_key not in raw_cache:
-            if raw_cache:
-                time.sleep(1.5)  # stagger distinct Yahoo calls to avoid tripping rate limits
-            raw_cache[base_key] = fetch_futures_bars(ticker, plan["interval"], plan["period"])
-        base_df, base_err = raw_cache[base_key]
-        if base_df is None:
+def build_all_timeframe_cvd(symbol: str):
+    results, errors = {}, {}
+    for i, tf in enumerate(TIMEFRAMES):
+        if i > 0:
+            time.sleep(1.0)  # stay well under Twelve Data's per-minute rate limit
+        raw, err = fetch_td_bars(symbol, _TD_INTERVAL[tf], _TD_OUTPUTSIZE[tf])
+        if raw is None:
             results[tf] = None
-            errors[tf] = base_err
+            errors[tf] = err
             continue
-        working_df = resample_bars(base_df, plan["resample"]) if plan["resample"] else base_df
-        cvd_df = compute_cvd_proxy(working_df)
+        cvd_df = compute_cvd_proxy(raw)
         results[tf] = cvd_df
-        errors[tf] = None if cvd_df is not None else "Not enough bars to compute ATR/CVD yet."
+        errors[tf] = None if cvd_df is not None else "Not enough bars yet to compute ATR/CVD."
     return results, errors
 
 
@@ -472,10 +422,17 @@ st.set_page_config(page_title="FX Macro & Order-Flow Dashboard", page_icon="📊
 
 st.title("📊 FX Macro & Multi-Timeframe CVD Dashboard")
 st.caption(
-    "CVD is a futures-volume-derived proxy for spot order flow, not a direct tick-data feed. "
-    "Fundamentals are reference notes verified as of "
+    "CVD source: Twelve Data live OHLCV feed. Volume-weighted when the feed reports "
+    "real volume for the pair, tick-direction proxy otherwise (auto-detected, always "
+    "labeled). Fundamentals verified as of "
     f"**{FUNDAMENTALS_VERIFIED_AS_OF}** -- re-verify before trading on them."
 )
+if USING_DEMO_KEY:
+    st.warning(
+        "Using Twelve Data's shared public `demo` API key -- this is heavily rate-limited "
+        "and may fail under normal use. Get a free key at twelvedata.com and add it as "
+        "`TWELVE_DATA_API_KEY` in your app's Secrets for reliable access."
+    )
 st.write("---")
 
 with st.sidebar:
@@ -484,13 +441,13 @@ with st.sidebar:
     noise_pct = st.slider(
         "Noise filter strength (% of ATR)", min_value=0, max_value=50, value=15, step=5,
         help="Bars with a range below this fraction of the rolling ATR are treated as chop "
-             "and contribute zero volume delta to the cumulative line.",
+             "and contribute zero to the cumulative delta line.",
     )
     auto_refresh = st.checkbox("Auto-refresh", value=True)
     st.write("---")
-    ticker, ticker_desc = FUTURES_PROXY[selected_pair]
-    st.markdown(f"**CVD proxy source:** `{ticker}` -- {ticker_desc}")
-    st.markdown(f"**Spot rate source:** open.er-api.com (rate snapshot, not tick data)")
+    td_symbol = TD_SYMBOLS[selected_pair]
+    st.markdown(f"**CVD data source:** Twelve Data -- `{td_symbol}`")
+    st.markdown("**Spot rate source:** open.er-api.com (rate snapshot, not tick data)")
     st.markdown(f"**Refresh interval:** {REFRESH_SECONDS}s")
 
 spot = fetch_spot_rates()
@@ -505,50 +462,42 @@ with col1:
 st.write("---")
 
 # ---------- CVD SECTION ----------
-st.markdown("## Order-Flow Proxy: Cumulative Volume Delta (CVD)")
+st.markdown("## Cumulative Volume Delta (CVD)")
 st.caption(
-    f"Source: {ticker_desc} ({ticker}) real OHLCV bars. Direction is classified per bar "
-    "(close vs open); low-conviction/chop bars below the noise threshold are excluded "
-    "from the cumulative sum rather than allowed to whipsaw it."
+    f"Source: Twelve Data `{td_symbol}` OHLCV bars, native 30min/1h/4h/1day intervals. "
+    "Direction classified per bar (close vs open); low-conviction/chop bars below the "
+    "noise threshold are excluded from the cumulative sum rather than allowed to whipsaw it."
 )
 
-if not YFINANCE_AVAILABLE:
-    st.error(
-        "The CVD section is disabled: `yfinance` could not be imported even after "
-        f"attempting a runtime install. Details: `{YFINANCE_IMPORT_ERROR}`. "
-        "Spot rates and fundamentals below still work. This points to something "
-        "blocking package installs entirely in this environment (e.g. no outbound "
-        "network access during app runtime, or a filesystem permissions issue) "
-        "rather than a simple missing-line-in-requirements.txt problem -- see the "
-        "diagnosis notes for next steps."
-    )
-
-tf_tabs = st.tabs(["30m", "1h", "4h", "1d"]) if YFINANCE_AVAILABLE else []
-all_cvd, all_errors = build_all_timeframe_cvd(ticker) if YFINANCE_AVAILABLE else ({}, {})
+tf_tabs = st.tabs(["30m", "1h", "4h", "1d"])
+all_cvd, all_errors = build_all_timeframe_cvd(td_symbol)
 
 for tf, tab in zip(TIMEFRAMES, tf_tabs):
     with tab:
-        raw = all_cvd.get(tf)
-        d = compute_cvd_proxy(raw, noise_atr_fraction=noise_pct / 100.0) if raw is not None else None
+        raw_result = all_cvd.get(tf)
+        d = compute_cvd_proxy(raw_result, noise_atr_fraction=noise_pct / 100.0) if raw_result is not None else None
         if d is None or d.empty:
             st.warning(
-                f"No {tf} futures data available right now. Not substituting synthetic "
-                f"data -- showing nothing is more honest than showing a guess.\n\n"
+                f"No {tf} data available right now. Not substituting synthetic data -- "
+                f"showing nothing is more honest than showing a guess.\n\n"
                 f"**Reason:** {all_errors.get(tf, 'unknown')}"
             )
             continue
 
         summary = summarize_cvd(d)
+        if summary["volume_mode"] == "tick-direction proxy":
+            st.caption(
+                "⚠️ This feed isn't reporting real trading volume for this pair right now, "
+                "so this is a **tick-direction proxy** (each bar counted as +1/-1), not a "
+                "true volume-weighted CVD."
+            )
         c1, c2, c3 = st.columns(3)
-        c1.metric("Latest CVD (contracts)", f"{summary['latest_cvd']:+,.0f}")
+        c1.metric("Latest CVD", f"{summary['latest_cvd']:+,.0f}")
         c2.metric("Recent trend", summary["bias"])
         c3.metric("Bars filtered as noise", f"{summary['filtered_pct']:.0f}%")
 
-        chart_df = d[["cvd"]].rename(columns={"cvd": f"CVD ({tf})"})
-        st.line_chart(chart_df)
-
-        price_df = d[["Close"]].rename(columns={"Close": f"{ticker} Close"})
-        st.line_chart(price_df)
+        st.line_chart(d[["cvd"]].rename(columns={"cvd": f"CVD ({tf})"}))
+        st.line_chart(d[["Close"]].rename(columns={"Close": f"{selected_pair} Close"}))
 
 st.write("---")
 
