@@ -65,6 +65,8 @@ Nothing here should be treated as a trading signal.
 """
 
 import datetime
+import html
+import re
 import time
 import xml.etree.ElementTree as ET
 
@@ -482,6 +484,31 @@ def keyword_sentiment(text: str):
     return score, label
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def extract_insight(raw_html_or_text: str, max_sentences: int = 2, max_chars: int = 220) -> str:
+    """
+    Turns a raw RSS <description> (often full of HTML markup, style attributes,
+    and list fragments) into a short, clean, sentence-bounded insight snippet --
+    not a link, not a markup dump, and not a mid-word truncation.
+    """
+    if not raw_html_or_text:
+        return ""
+    text = _TAG_RE.sub(" ", raw_html_or_text)   # strip HTML tags
+    text = html.unescape(text)                   # decode entities (&amp; etc.)
+    text = _WHITESPACE_RE.sub(" ", text).strip()  # collapse whitespace/newlines
+    if not text:
+        return ""
+    sentences = _SENTENCE_SPLIT_RE.split(text)
+    snippet = " ".join(sentences[:max_sentences]).strip()
+    if len(snippet) > max_chars:
+        snippet = snippet[:max_chars].rsplit(" ", 1)[0].rstrip(",;:") + "..."
+    return snippet
+
+
 @st.cache_data(ttl=1800)
 def fetch_rss_articles():
     """Zero-key fetch across all configured public RSS feeds. Skips any feed
@@ -497,15 +524,16 @@ def fetch_rss_articles():
                 title = (item.findtext("title") or "").strip()
                 link = (item.findtext("link") or "").strip()
                 pub = (item.findtext("pubDate") or "").strip()
-                desc = (item.findtext("description") or "").strip()
+                raw_desc = (item.findtext("description") or "").strip()
                 if title:
                     articles.append({
                         "title": title, "url": link, "time_published": pub,
-                        "summary": desc, "source": source_name,
+                        "summary": extract_insight(raw_desc), "source": source_name,
                     })
         except Exception:
             continue  # one broken feed shouldn't take down the others
     return articles
+
 
 
 def filter_articles_for_pair(articles, pair):
@@ -540,7 +568,7 @@ def fetch_news_sentiment_av(pair: str):
                 "source": item.get("source", "Unknown source"),
                 "url": item.get("url", ""),
                 "time_published": item.get("time_published", ""),
-                "summary": item.get("summary", ""),
+                "summary": extract_insight(item.get("summary", "")),
                 "sentiment_score": item.get("overall_sentiment_score"),
                 "sentiment_label": item.get("overall_sentiment_label", "Neutral"),
                 "mode": "ml",
@@ -571,7 +599,7 @@ def fetch_news_sentiment(pair: str):
         score, label = keyword_sentiment(a["title"] + " " + a["summary"])
         articles.append({
             "title": a["title"], "source": a["source"], "url": a["url"],
-            "time_published": a["time_published"], "summary": a["summary"][:200],
+            "time_published": a["time_published"], "summary": a["summary"],
             "sentiment_score": score, "sentiment_label": label, "mode": "heuristic",
         })
     return articles, None, "heuristic"
@@ -989,7 +1017,11 @@ else:
             f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} "
             f"({a['time_published'][:16]})"
         )
-        st.caption(f"Sentiment: {label} ({score}) -- {a['summary'][:180]}{'...' if len(a['summary']) > 180 else ''}")
+        insight = a["summary"].strip()
+        if insight:
+            st.caption(f"Sentiment: {label} ({score}) -- {insight}")
+        else:
+            st.caption(f"Sentiment: {label} ({score})")
 
 st.write("---")
 st.caption(
