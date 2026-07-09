@@ -1,6 +1,5 @@
 import datetime
 import json
-import random
 import threading
 import time
 import urllib.request
@@ -47,7 +46,7 @@ MACRO_INTELLIGENCE_MATRIX = {
 }
 
 # ==========================================
-# 🧠 ZERO-DEPENDENCY LIVE ENGINE CORE
+# 🧠 ZERO-DEPENDENCY ENGINE (SMOOTHED)
 # ==========================================
 class ZeroDependencyEngine:
 
@@ -56,6 +55,7 @@ class ZeroDependencyEngine:
         self.lock = threading.Lock()
         self.running = True
 
+        # Internal tracking memory arrays
         self.chart_history = {
             pair: {"Timestamp": [], "Price": [], "CVD": []}
             for pair in MAJOR_PAIRS
@@ -71,15 +71,20 @@ class ZeroDependencyEngine:
             }
 
     def start(self):
+        """Launches background workers."""
         threading.Thread(target=self._live_feed_loop, daemon=True).start()
 
     def _live_feed_loop(self):
-        """Fetches high-frequency forex ticks using native urllib without external dependencies."""
+        """Fetches forex rates and applies an EMA smoothing filter to eliminate noise."""
         last_prices = {pair: None for pair in MAJOR_PAIRS}
+        
+        # Track smoothing states for each asset pair
+        smoothed_delta = {pair: 0.0 for pair in MAJOR_PAIRS}
+        alpha = 0.15  # Smoothing alpha factor (Lower = smoother line, higher = faster response)
 
         while self.running:
             try:
-                # Querying a native public exchange rate API matrix over TLS
+                # Direct public cloud network API query via native TLS request
                 req = urllib.request.Request(
                     "https://open.er-api.com/v6/latest/USD",
                     headers={"User-Agent": "Mozilla/5.0"}
@@ -102,41 +107,50 @@ class ZeroDependencyEngine:
                         if price == 0.0:
                             continue
 
-                        # Generate fluid micro-movements to simulate live orders between macro intervals
-                        direction = random.choice([-1, 1])
-                        micro_spread = price * 0.00004 * random.random()
-                        price += direction * micro_spread
-
                         prev_price = last_prices[pair]
-                        tick_delta = 0.0
+                        raw_tick_delta = 0.0
 
                         if prev_price is not None:
                             diff = price - prev_price
-                            tick_direction = 1 if diff > 0 else (-1 if diff < 0 else random.choice([-1, 1]))
-                            simulated_vol = max(abs(diff) * 600000, random.randint(15, 95))
-                            tick_delta = tick_direction * simulated_vol
+                            
+                            if diff != 0:
+                                # Price moved: calculate a true directional volume delta
+                                tick_direction = 1 if diff > 0 else -1
+                                raw_tick_delta = tick_direction * (abs(diff) * 800000)
+                            else:
+                                # Price flatlined: drop core delta generation to 0 to prevent noise
+                                raw_tick_delta = 0.0
                         else:
-                            tick_delta = random.uniform(-20, 20)
+                            raw_tick_delta = 0.0
 
                         last_prices[pair] = price
 
+                        # --- EXPONENTIAL MOVING AVERAGE NOISE FILTER ---
+                        smoothed_delta[pair] = (alpha * raw_tick_delta) + ((1 - alpha) * smoothed_delta[pair])
+                        
+                        # Apply noise floor threshold filter
+                        if abs(smoothed_delta[pair]) < 0.05:
+                            final_delta = 0.0
+                        else:
+                            final_delta = smoothed_delta[pair]
+
                         with self.lock:
                             self.market_state[pair]["close_price"] = price
-                            self.market_state[pair]["bar_delta"] = tick_delta
-                            self.market_state[pair]["CVD"] += tick_delta
+                            self.market_state[pair]["bar_delta"] = final_delta
+                            self.market_state[pair]["CVD"] += final_delta
 
-                            # Save data to internal history arrays
+                            # Save data snapshot to history structures
                             self.chart_history[pair]["Timestamp"].append(timestamp)
                             self.chart_history[pair]["Price"].append(price)
                             self.chart_history[pair]["CVD"].append(self.market_state[pair]["CVD"])
 
-                            # Keep only the last 40 entries
+                            # Constrain Lookback Array memory limit to latest 40 periods
                             if len(self.chart_history[pair]["Timestamp"]) > 40:
                                 self.chart_history[pair]["Timestamp"].pop(0)
                                 self.chart_history[pair]["Price"].pop(0)
                                 self.chart_history[pair]["CVD"].pop(0)
 
-                            # Populate static structural wires
+                            # Populate static fundamental wires
                             biases = {"EURUSD": "BEARISH", "GBPUSD": "BULLISH", "USDJPY": "BEARISH", "AUDUSD": "NEUTRAL"}
                             wires = {
                                 "EURUSD": "ECB signaling aggressive rate cuts due to slowing Eurozone production index.",
@@ -151,89 +165,10 @@ class ZeroDependencyEngine:
                 pass
             time.sleep(1.5)
 
+
 # ==========================================
 # 📊 STREAMLIT FRONTEND APP SETUP
 # ==========================================
 @st.cache_resource
 def get_active_engine():
     engine = ZeroDependencyEngine()
-    engine.start()
-    return engine
-
-st.set_page_config(page_title="FX CVD Engine Dashboard", page_icon="⚡", layout="wide")
-
-st.title("⚡ High-Frequency FX CVD & Macro Dashboard")
-st.markdown("Terminal interface capturing institutional order-flow trajectories.")
-st.write("---")
-
-engine = get_active_engine()
-
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    selected_pair = st.selectbox("Select Core Trading Pair Asset:", MAJOR_PAIRS)
-    st.write("---")
-    st.markdown("**Engine Frequency:** `1.5 Hz Cloud Polling` ")
-    st.markdown("**Data Interface Pipeline:** `Native TLS urllib Stream` ")
-
-with engine.lock:
-    metrics = engine.market_state[selected_pair].copy()
-    history = {k: v[:] for k, v in engine.chart_history[selected_pair].items()}
-
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(label=f"🔴 Live Close Price ({selected_pair})", value=f"{metrics['close_price']:.5f}")
-with col2:
-    st.metric(label="⚡ Recent Tick Volume Delta", value=f"{metrics['bar_delta']:+,.2f} contracts")
-with col3:
-    st.metric(label="📊 Accumulated Session CVD Strength", value=f"{metrics['CVD']:+,.2f} accum-ticks")
-
-st.write("---")
-
-chart_left, chart_right = st.columns(2)
-
-with chart_left:
-    st.markdown("### 💵 Real-Time Price Discovery Line")
-    if len(history["Price"]) > 1:
-        chart_data = {"Price": history["Price"]}
-        st.line_chart(chart_data)
-    else:
-        st.info("Gathering price history nodes... (Allow 2 seconds)")
-
-with chart_right:
-    st.markdown("### 📉 Cumulative Volume Delta (CVD) Signature")
-    if len(history["CVD"]) > 1:
-        chart_data = {"CVD": history["CVD"]}
-        st.line_chart(chart_data)
-    else:
-        st.info("Gathering volume delta nodes... (Allow 2 seconds)")
-
-st.write("---")
-
-st.markdown("## 🌍 Geopolitical Intelligence & Deep Macroeconomic Matrix")
-macro_data = MACRO_INTELLIGENCE_MATRIX[selected_pair]
-
-m_col1, m_col2, m_col3 = st.columns(3)
-with m_col1:
-    st.info(f"🏛️ **Central Bank Counterparty:** \n\n {macro_data['central_bank']}")
-    st.text_input("Current Benchmark Interest Rate", value=macro_data["interest_rate"], disabled=True)
-
-with m_col2:
-    st.warning(f"📈 **Inflation Track (CPI):** \n\n {macro_data['inflation_cpi']}")
-    st.text_input("Macro Growth Outlook (GDP)", value=macro_data["gdp_growth"], disabled=True)
-
-with m_col3:
-    st.error(f"⚠️ **Primary Geopolitical Risk Vector:** \n\n {macro_data['risk_factor']}")
-    st.text_input("Institutional Sentiment Score Index", value=macro_data["sentiment_score"], disabled=True)
-
-bias = metrics["macro_bias"]
-if bias == "BULLISH":
-    st.success(f"📈 **ALGO INTERPRETATION BIAS:** {bias}")
-elif bias == "BEARISH":
-    st.error(f"📉 **ALGO INTERPRETATION BIAS:** {bias}")
-else:
-    st.warning(f"⚖️ **ALGO INTERPRETATION BIAS:** {bias}")
-
-st.markdown(f"> **Live Fundamental Analytical Wire Summary:** \"{metrics['latest_impact_news']}\"")
-
-time.sleep(1.5)
-st.rerun()
