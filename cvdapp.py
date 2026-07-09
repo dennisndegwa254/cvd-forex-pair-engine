@@ -31,31 +31,34 @@ non-zero volume for the selected pair:
     (each bar contributes +1/-1 rather than +/-volume) and labels this
     clearly in the UI. It never silently fakes volume numbers.
 
-SETUP REQUIRED: three free API keys, all added the same way.
+SETUP: two of these three keys are genuinely REQUIRED; the third is optional.
 In Streamlit Cloud: Manage app -> Settings -> Secrets. Locally: .streamlit/secrets.toml.
 
-  1. TWELVE_DATA_API_KEY  -- twelvedata.com (free: 800 req/day, 8/min)
-     Powers the CVD price/volume bars. Falls back to a shared, heavily
+  1. TWELVE_DATA_API_KEY  -- REQUIRED for the CVD section.
+     twelvedata.com (free: 800 req/day, 8/min). Falls back to a shared, heavily
      rate-limited "demo" key if not set.
 
-  2. FINNHUB_API_KEY      -- finnhub.io (free: 60 req/min)
-     Powers the live economic calendar (recent releases + upcoming events).
-     Note: the economic-calendar endpoint's free-tier access has shifted over
-     time on Finnhub's side -- if you get a 403, check your Finnhub dashboard's
-     plan/endpoint access page.
+  2. FINNHUB_API_KEY      -- REQUIRED for the live economic calendar.
+     finnhub.io (free: 60 req/min, no card needed). There is no reliable
+     zero-key equivalent for a real multi-country calendar -- the free scraped
+     alternatives are exactly the kind of fragile source that broke the CVD
+     section earlier in this build. Note: the economic-calendar endpoint's
+     free-tier access has shifted over time on Finnhub's side -- if you get a
+     403, check your Finnhub dashboard's plan/endpoint access page.
 
-  3. ALPHAVANTAGE_API_KEY -- alphavantage.co (free: 25 req/day, 5/min)
-     Powers the news + sentiment feed. This tier is genuinely tight, so that
-     section fetches on a manual button click and caches for 6 hours -- it
-     does NOT auto-refresh with the rest of the page.
+  3. ALPHAVANTAGE_API_KEY -- OPTIONAL, upgrades the news section only.
+     alphavantage.co (free: 25 req/day, 5/min). Without this key, News &
+     Sentiment runs automatically on a zero-key fallback instead: public RSS
+     feeds (ForexLive, Investing.com) scored with a transparent local keyword
+     heuristic (hawkish/dovish/bullish/bearish word counts) rather than ML
+     sentiment. It works immediately with no signup. Add this key later for
+     real ML-scored sentiment -- when present, that section switches to a
+     manual-fetch button instead, since the free AV tier is only 25 req/day.
 
 Secrets file example:
     TWELVE_DATA_API_KEY = "..."
     FINNHUB_API_KEY = "..."
-    ALPHAVANTAGE_API_KEY = "..."
-
-Any of the three can be left unset -- that section will show a clear setup
-message instead of crashing the rest of the app.
+    ALPHAVANTAGE_API_KEY = "..."   # optional
 
 DISCLAIMER: This is an analytical/educational tool, not investment advice.
 Nothing here should be treated as a trading signal.
@@ -63,6 +66,7 @@ Nothing here should be treated as a trading signal.
 
 import datetime
 import time
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
@@ -352,8 +356,12 @@ def fetch_economic_calendar():
     """Returns (past_events, future_events, error). Each event is a dict."""
     if not FINNHUB_API_KEY:
         return [], [], (
-            "No Finnhub API key configured. Sign up free at finnhub.io, then add "
-            "FINNHUB_API_KEY in your app's Secrets to enable the live calendar."
+            "No Finnhub API key configured. Unlike the news section, there's no "
+            "reliable zero-key equivalent for a real multi-country economic "
+            "calendar (the free scraped alternatives are exactly the kind of "
+            "fragile, IP-blockable sources that broke the CVD section earlier in "
+            "this build). Finnhub's signup is quick and free though: sign up at "
+            "finnhub.io (no card required), then add FINNHUB_API_KEY in Secrets."
         )
     try:
         today = datetime.date.today()
@@ -416,18 +424,100 @@ def filter_calendar_for_pair(past, future, pair, impact_filter=("high", "medium"
 
 
 # ==========================================
-# NEWS + SENTIMENT (Alpha Vantage) -- free tier is only 25 requests/day,
-# so this is cached for hours and fetched on-demand, not on every rerun.
+# NEWS + SENTIMENT
+# Two paths, auto-selected -- neither requires setup to get SOMETHING working:
+#   1. Alpha Vantage (if ALPHAVANTAGE_API_KEY is set): real ML sentiment scoring,
+#      but free tier is only 25 req/day, so it's cached 6h and fetched on a
+#      manual button click rather than auto-refreshing.
+#   2. RSS fallback (zero API key required, works immediately): pulls public
+#      forex-news RSS feeds and scores each headline with a simple local
+#      keyword heuristic. This is NOT ML-grade sentiment -- it's transparent
+#      word-counting (hawkish/dovish/bullish/bearish terms) -- but it needs no
+#      signup and has no meaningful rate limit, so it runs the moment the app
+#      loads instead of requiring the user to configure anything first.
 # ==========================================
+
+RSS_NEWS_FEEDS = [
+    ("ForexLive", "https://www.forexlive.com/feed"),
+    ("Investing.com Forex News", "https://www.investing.com/rss/news_1.rss"),
+]
+
+CURRENCY_KEYWORDS = {
+    "EUR": ["euro", "eur", "ecb", "eurozone", "european central bank"],
+    "USD": ["dollar", "usd", "fed", "federal reserve", "fomc", "greenback"],
+    "GBP": ["pound", "gbp", "boe", "bank of england", "sterling", "cable"],
+    "JPY": ["yen", "jpy", "boj", "bank of japan"],
+    "AUD": ["aussie", "aud", "rba", "australian dollar"],
+}
+
+_BULLISH_WORDS = [
+    "hike", "hikes", "hiking", "hawkish", "rally", "rallies", "surge", "surges",
+    "strengthen", "strengthens", "gains", "tighten", "tightening", "raise rates",
+    "beats expectations", "stronger than expected", "upside surprise",
+]
+_BEARISH_WORDS = [
+    "cut", "cuts", "cutting", "dovish", "plunge", "plunges", "slump", "slumps",
+    "weaken", "weakens", "losses", "ease", "easing", "recession", "slowdown",
+    "misses expectations", "weaker than expected", "downside surprise",
+]
+
+
+def keyword_sentiment(text: str):
+    """Transparent local heuristic -- not ML sentiment. Counts hawkish/dovish
+    and bullish/bearish terms in the text and nets them out."""
+    t = text.lower()
+    bull = sum(t.count(w) for w in _BULLISH_WORDS)
+    bear = sum(t.count(w) for w in _BEARISH_WORDS)
+    score = bull - bear
+    if score > 1:
+        label = "Bullish (heuristic)"
+    elif score == 1:
+        label = "Somewhat-Bullish (heuristic)"
+    elif score == 0:
+        label = "Neutral (heuristic)"
+    elif score == -1:
+        label = "Somewhat-Bearish (heuristic)"
+    else:
+        label = "Bearish (heuristic)"
+    return score, label
+
+
+@st.cache_data(ttl=1800)
+def fetch_rss_articles():
+    """Zero-key fetch across all configured public RSS feeds. Skips any feed
+    that fails rather than erroring out the whole section."""
+    articles = []
+    for source_name, url in RSS_NEWS_FEEDS:
+        try:
+            resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            items = root.findall(".//item")
+            for item in items[:15]:
+                title = (item.findtext("title") or "").strip()
+                link = (item.findtext("link") or "").strip()
+                pub = (item.findtext("pubDate") or "").strip()
+                desc = (item.findtext("description") or "").strip()
+                if title:
+                    articles.append({
+                        "title": title, "url": link, "time_published": pub,
+                        "summary": desc, "source": source_name,
+                    })
+        except Exception:
+            continue  # one broken feed shouldn't take down the others
+    return articles
+
+
+def filter_articles_for_pair(articles, pair):
+    base, quote = pair[:3], pair[3:]
+    kws = CURRENCY_KEYWORDS.get(base, []) + CURRENCY_KEYWORDS.get(quote, [])
+    relevant = [a for a in articles if any(k in (a["title"] + " " + a["summary"]).lower() for k in kws)]
+    return relevant if relevant else articles[:8]  # fall back to general market news
+
+
 @st.cache_data(ttl=6 * 3600)
-def fetch_news_sentiment(pair: str):
-    """Returns (list_of_articles, error)."""
-    if not ALPHAVANTAGE_API_KEY:
-        return [], (
-            "No Alpha Vantage API key configured. Sign up free at alphavantage.co, "
-            "then add ALPHAVANTAGE_API_KEY in your app's Secrets. Note: free tier is "
-            "only 25 requests/day, so this section refreshes every 6 hours, not live."
-        )
+def fetch_news_sentiment_av(pair: str):
+    """Alpha Vantage path -- real ML sentiment, but quota-limited to 25/day."""
     try:
         resp = requests.get(
             "https://www.alphavantage.co/query",
@@ -441,10 +531,7 @@ def fetch_news_sentiment(pair: str):
         )
         payload = resp.json()
         if "Note" in payload or "Information" in payload:
-            return [], (
-                "Alpha Vantage quota message: "
-                f"{payload.get('Note') or payload.get('Information')}"
-            )
+            return [], f"Alpha Vantage quota message: {payload.get('Note') or payload.get('Information')}"
         feed = payload.get("feed", [])
         articles = []
         for item in feed[:8]:
@@ -456,10 +543,38 @@ def fetch_news_sentiment(pair: str):
                 "summary": item.get("summary", ""),
                 "sentiment_score": item.get("overall_sentiment_score"),
                 "sentiment_label": item.get("overall_sentiment_label", "Neutral"),
+                "mode": "ml",
             })
         return articles, None
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
+
+
+def fetch_news_sentiment(pair: str):
+    """
+    Returns (list_of_articles, error, mode) where mode is 'ml' (Alpha Vantage)
+    or 'heuristic' (zero-key RSS fallback). Auto-selects based on whether a
+    key is configured -- the section works immediately either way.
+    """
+    if ALPHAVANTAGE_API_KEY:
+        articles, err = fetch_news_sentiment_av(pair)
+        if articles or err is None:
+            return articles, err, "ml"
+        # fall through to RSS if AV fails for any reason
+
+    raw = fetch_rss_articles()
+    if not raw:
+        return [], "Both the Alpha Vantage and RSS fallback paths returned nothing -- check network/outbound access.", "heuristic"
+    relevant = filter_articles_for_pair(raw, pair)
+    articles = []
+    for a in relevant[:8]:
+        score, label = keyword_sentiment(a["title"] + " " + a["summary"])
+        articles.append({
+            "title": a["title"], "source": a["source"], "url": a["url"],
+            "time_published": a["time_published"], "summary": a["summary"][:200],
+            "sentiment_score": score, "sentiment_label": label, "mode": "heuristic",
+        })
+    return articles, None, "heuristic"
 
 
 # ==========================================
@@ -672,7 +787,7 @@ with st.sidebar:
     st.markdown("**API key status**")
     st.markdown(f"{'🟢' if not USING_DEMO_KEY else '🟡'} Twelve Data: {'configured' if not USING_DEMO_KEY else 'using shared demo key'}")
     st.markdown(f"{'🟢' if FINNHUB_API_KEY else '🔴'} Finnhub (calendar): {'configured' if FINNHUB_API_KEY else 'not set'}")
-    st.markdown(f"{'🟢' if ALPHAVANTAGE_API_KEY else '🔴'} Alpha Vantage (news): {'configured' if ALPHAVANTAGE_API_KEY else 'not set'}")
+    st.markdown(f"{'🟢' if ALPHAVANTAGE_API_KEY else '🟡'} News/sentiment: {'Alpha Vantage ML' if ALPHAVANTAGE_API_KEY else 'RSS + heuristic (no key needed)'}")
 
 spot = fetch_spot_rates()
 col1, col2 = st.columns([1, 2])
@@ -832,32 +947,49 @@ st.write("---")
 
 # --- Tier 3: news + sentiment ---
 st.markdown("### 📰 News & Sentiment")
-news_key = f"_news_{selected_pair}"
-if st.button("Fetch latest headlines", key=f"btn_{news_key}"):
-    st.session_state[news_key] = fetch_news_sentiment(selected_pair)
 
-if news_key not in st.session_state:
-    st.caption(
-        "Not fetched yet this session -- click the button above. This is manual rather "
-        "than auto-refreshing because the free Alpha Vantage tier is limited to 25 "
-        "requests/day; auto-refreshing every 45s would burn through that in under 20 minutes."
-    )
-else:
-    articles, news_err = st.session_state[news_key]
-    if news_err:
-        st.warning(news_err)
-    elif not articles:
-        st.caption("No recent articles returned for this pair's currencies.")
+if ALPHAVANTAGE_API_KEY:
+    news_key = f"_news_{selected_pair}"
+    if st.button("Fetch latest headlines (Alpha Vantage, ML sentiment)", key=f"btn_{news_key}"):
+        st.session_state[news_key] = fetch_news_sentiment(selected_pair)
+    if news_key not in st.session_state:
+        st.caption(
+            "Not fetched yet this session -- click the button above. This is manual "
+            "rather than auto-refreshing because the free Alpha Vantage tier is "
+            "limited to 25 requests/day."
+        )
+        articles, news_err, mode = [], None, None
     else:
-        for a in articles:
-            score = a["sentiment_score"]
-            label = a["sentiment_label"]
-            emoji = "🟢" if "Bullish" in label else ("🔴" if "Bearish" in label else "⚪")
-            st.markdown(
-                f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} "
-                f"({a['time_published'][:8]})"
-            )
-            st.caption(f"Sentiment: {label} ({score}) -- {a['summary'][:180]}{'...' if len(a['summary']) > 180 else ''}")
+        articles, news_err, mode = st.session_state[news_key]
+else:
+    # Zero-key path: runs immediately, no button, no signup needed.
+    st.caption(
+        "Running on the free, zero-setup RSS + local keyword-sentiment path (no API "
+        "key configured). Add ALPHAVANTAGE_API_KEY in Secrets for real ML-scored "
+        "sentiment instead of this word-counting heuristic."
+    )
+    articles, news_err, mode = fetch_news_sentiment(selected_pair)
+
+if news_err:
+    st.warning(news_err)
+elif not articles:
+    st.caption("No recent articles returned for this pair's currencies.")
+else:
+    if mode == "heuristic":
+        st.caption(
+            "⚠️ Sentiment labels below are a simple keyword heuristic (counts "
+            "hawkish/dovish/bullish/bearish terms), not ML-based scoring -- treat "
+            "them as a rough read, not a precise signal."
+        )
+    for a in articles:
+        score = a["sentiment_score"]
+        label = a["sentiment_label"]
+        emoji = "🟢" if "Bullish" in label else ("🔴" if "Bearish" in label else "⚪")
+        st.markdown(
+            f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} "
+            f"({a['time_published'][:16]})"
+        )
+        st.caption(f"Sentiment: {label} ({score}) -- {a['summary'][:180]}{'...' if len(a['summary']) > 180 else ''}")
 
 st.write("---")
 st.caption(
