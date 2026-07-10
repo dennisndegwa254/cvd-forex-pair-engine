@@ -31,20 +31,26 @@ non-zero volume for the selected pair:
     (each bar contributes +1/-1 rather than +/-volume) and labels this
     clearly in the UI. It never silently fakes volume numbers.
 
-SETUP: two of these three keys are genuinely REQUIRED; the third is optional.
+SETUP: only ONE of these three keys is genuinely REQUIRED; the other two are
+optional upgrades -- their sections run on zero-key fallbacks without them.
 In Streamlit Cloud: Manage app -> Settings -> Secrets. Locally: .streamlit/secrets.toml.
 
-  1. TWELVE_DATA_API_KEY  -- REQUIRED for the CVD section.
+  1. TWELVE_DATA_API_KEY  -- REQUIRED for the CVD section (no fallback exists;
+     real futures OHLCV needs a real data provider).
      twelvedata.com (free: 800 req/day, 8/min). Falls back to a shared, heavily
      rate-limited "demo" key if not set.
 
-  2. FINNHUB_API_KEY      -- REQUIRED for the live economic calendar.
-     finnhub.io (free: 60 req/min, no card needed). There is no reliable
-     zero-key equivalent for a real multi-country calendar -- the free scraped
-     alternatives are exactly the kind of fragile source that broke the CVD
-     section earlier in this build. Note: the economic-calendar endpoint's
-     free-tier access has shifted over time on Finnhub's side -- if you get a
-     403, check your Finnhub dashboard's plan/endpoint access page.
+  2. FINNHUB_API_KEY      -- OPTIONAL, upgrades the calendar section only.
+     finnhub.io (free: 60 req/min, no card needed). Without this key, the Live
+     Economic Calendar runs on a zero-key fallback: "upcoming" shows each
+     relevant central bank's next confirmed meeting date (these are published
+     by the banks themselves a year+ in advance, so no live API is needed for
+     that part), and "recent releases" reuses the actual-vs-estimate figures
+     already being extracted from the RSS news feed. Add this key for a fuller
+     multi-event calendar (CPI, NFP, GDP, etc.), not just central bank dates.
+     Note: the economic-calendar endpoint's free-tier access has shifted over
+     time on Finnhub's side -- if you get a 403, the app automatically falls
+     back to the zero-key path rather than showing a dead section.
 
   3. ALPHAVANTAGE_API_KEY -- OPTIONAL, upgrades the news section only.
      alphavantage.co (free: 25 req/day, 5/min). Without this key, News &
@@ -57,7 +63,7 @@ In Streamlit Cloud: Manage app -> Settings -> Secrets. Locally: .streamlit/secre
 
 Secrets file example:
     TWELVE_DATA_API_KEY = "..."
-    FINNHUB_API_KEY = "..."
+    FINNHUB_API_KEY = "..."        # optional
     ALPHAVANTAGE_API_KEY = "..."   # optional
 
 DISCLAIMER: This is an analytical/educational tool, not investment advice.
@@ -65,6 +71,7 @@ Nothing here should be treated as a trading signal.
 """
 
 import datetime
+import email.utils
 import html
 import re
 import time
@@ -346,75 +353,159 @@ def fetch_spot_rates():
 
 # ==========================================
 # LIVE ECONOMIC CALENDAR (scheduled-data tier)
-# Real upcoming/past events instead of a hand-typed date that goes stale the
-# moment a meeting passes. Requires a free Finnhub API key.
+# Two paths, same as the news section:
+#   1. Finnhub (if FINNHUB_API_KEY set): full multi-event calendar (CPI, NFP,
+#      GDP, etc.), not just central bank decisions.
+#   2. Zero-key fallback (always available): central bank meeting dates are
+#      published by each bank itself a year+ in advance, so "next meeting"
+#      needs no live API at all -- just a reference table, refreshed
+#      periodically. Combined with real actual-vs-estimate figures already
+#      being extracted from the RSS news feed (same extract_data_point used
+#      in News & Sentiment), this covers both "next event" and "recent
+#      actual releases" with zero signup required.
 # ==========================================
 CALENDAR_LOOKBACK_DAYS = 14
 CALENDAR_LOOKAHEAD_DAYS = 45
 
+# Official confirmed 2026 policy meeting/decision dates, sourced directly from
+# each central bank's own published calendar. These are the LAST day of each
+# meeting (i.e. the decision/announcement date). Verify against the source if
+# using this near a year boundary or if a bank reschedules a meeting.
+#   Fed: federalreserve.gov/monetarypolicy/fomccalendars.htm
+#   ECB: ecb.europa.eu/press/calendars/mgcgc
+#   BoE: bankofengland.co.uk/monetary-policy/upcoming-mpc-dates
+#   BoJ: boj.or.jp/en/mopo/mpmsche_minu (Sep/Oct/Dec dates approximate --
+#        BoJ had not published exact days for those 2026 meetings as of the
+#        last verification date below)
+#   RBA: rba.gov.au/monetary-policy/int-rate-decisions
+CENTRAL_BANK_MEETING_DATES_VERIFIED_AS_OF = "2026-07-11"
+CENTRAL_BANK_MEETING_DATES_2026 = {
+    "Fed": ["2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+            "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09"],
+    "ECB": ["2026-03-19", "2026-04-30", "2026-06-11", "2026-07-23",
+            "2026-09-10", "2026-10-29", "2026-12-17"],
+    "BoE": ["2026-02-05", "2026-03-19", "2026-04-30", "2026-06-18",
+            "2026-07-30", "2026-09-17", "2026-11-05", "2026-12-17"],
+    "BoJ": ["2026-01-23", "2026-03-19", "2026-04-28", "2026-06-17",
+            "2026-07-31", "2026-09-25", "2026-10-30", "2026-12-18"],  # last 3 approximate
+    "RBA": ["2026-02-03", "2026-03-17", "2026-05-05", "2026-06-16",
+            "2026-08-11", "2026-09-29", "2026-11-03", "2026-12-08"],
+}
+BANK_COUNTRY = {"Fed": "US", "ECB": "EU", "BoE": "GB", "BoJ": "JP", "RBA": "AU"}
+CURRENCY_TO_COUNTRY = {"USD": "US", "EUR": "EU", "GBP": "GB", "JPY": "JP", "AUD": "AU"}
+
+
+def build_zero_key_future_events(reference_date=None):
+    """Next scheduled meeting per bank, from the confirmed reference table
+    above -- no API call needed since these dates are public knowledge."""
+    ref = reference_date or datetime.datetime.utcnow()
+    events = []
+    for bank, dates in CENTRAL_BANK_MEETING_DATES_2026.items():
+        for d in dates:
+            dt = datetime.datetime.strptime(d, "%Y-%m-%d")
+            if dt > ref:
+                events.append({
+                    "country": BANK_COUNTRY[bank], "event": f"{bank} policy decision",
+                    "impact": "high", "actual": None, "estimate": None, "prev": None,
+                    "time": dt,
+                })
+                break  # only the next one per bank
+    events.sort(key=lambda x: x["time"])
+    return events
+
+
+def build_zero_key_past_events():
+    """Reuses the RSS feed already fetched for News & Sentiment -- pulls out
+    any headline with a real actual-vs-expected figure via the same
+    extract_data_point used there, so this costs zero extra requests."""
+    articles = fetch_rss_articles()
+    events = []
+    for a in articles:
+        dp = extract_data_point(a["title"])
+        if dp is None:
+            continue
+        text_l = (a["title"] + " " + a["summary"]).lower()
+        country = None
+        for cur, kws in CURRENCY_KEYWORDS.items():
+            if any(k in text_l for k in kws):
+                country = CURRENCY_TO_COUNTRY.get(cur)
+                break
+        if country is None:
+            continue  # can't confidently attribute this to a currency/country
+        try:
+            t = email.utils.parsedate_to_datetime(a["time_published"])
+            if t.tzinfo is not None:
+                t = t.replace(tzinfo=None)
+        except Exception:
+            t = None
+        if t is None:
+            continue
+        events.append({
+            "country": country, "event": dp["event"], "impact": "medium",
+            "actual": dp["actual"], "estimate": dp["expected"], "prev": None, "time": t,
+        })
+    events.sort(key=lambda x: x["time"], reverse=True)
+    return events
+
 
 @st.cache_data(ttl=1800)  # calendar data doesn't need to refresh every 45s
 def fetch_economic_calendar():
-    """Returns (past_events, future_events, error). Each event is a dict."""
-    if not FINNHUB_API_KEY:
-        return [], [], (
-            "No Finnhub API key configured. Unlike the news section, there's no "
-            "reliable zero-key equivalent for a real multi-country economic "
-            "calendar (the free scraped alternatives are exactly the kind of "
-            "fragile, IP-blockable sources that broke the CVD section earlier in "
-            "this build). Finnhub's signup is quick and free though: sign up at "
-            "finnhub.io (no card required), then add FINNHUB_API_KEY in Secrets."
-        )
-    try:
-        today = datetime.date.today()
-        frm = (today - datetime.timedelta(days=CALENDAR_LOOKBACK_DAYS)).isoformat()
-        to = (today + datetime.timedelta(days=CALENDAR_LOOKAHEAD_DAYS)).isoformat()
-        resp = requests.get(
-            "https://finnhub.io/api/v1/calendar/economic",
-            params={"from": frm, "to": to, "token": FINNHUB_API_KEY},
-            timeout=10,
-        )
-        if resp.status_code == 403:
-            return [], [], (
-                "Finnhub returned 403 (access denied) for the economic calendar "
-                "endpoint -- on some Finnhub account tiers this specific endpoint "
-                "requires a paid plan. Check your Finnhub dashboard's plan/endpoint "
-                "access page to confirm."
+    """Returns (past_events, future_events, error, source). source is
+    'finnhub' or 'zero_key'. error is only set for genuine failures --
+    the zero-key path is a normal operating mode, not an error state."""
+    if FINNHUB_API_KEY:
+        try:
+            today = datetime.date.today()
+            frm = (today - datetime.timedelta(days=CALENDAR_LOOKBACK_DAYS)).isoformat()
+            to = (today + datetime.timedelta(days=CALENDAR_LOOKAHEAD_DAYS)).isoformat()
+            resp = requests.get(
+                "https://finnhub.io/api/v1/calendar/economic",
+                params={"from": frm, "to": to, "token": FINNHUB_API_KEY},
+                timeout=10,
             )
-        resp.raise_for_status()
-        payload = resp.json()
-        events = payload.get("economicCalendar") or payload.get("data") or []
-        if not isinstance(events, list):
-            return [], [], "Unexpected response shape from Finnhub calendar endpoint."
+            if resp.status_code == 403:
+                raise RuntimeError(
+                    "Finnhub returned 403 -- this endpoint requires a paid plan on "
+                    "your account tier. Falling back to the zero-key calendar."
+                )
+            resp.raise_for_status()
+            payload = resp.json()
+            events = payload.get("economicCalendar") or payload.get("data") or []
+            if not isinstance(events, list):
+                raise RuntimeError("Unexpected response shape from Finnhub.")
 
-        now = datetime.datetime.utcnow()
-        past, future = [], []
-        for e in events:
-            t_raw = e.get("time")
-            try:
-                t = datetime.datetime.fromisoformat(t_raw.replace("Z", "")) if t_raw else None
-            except Exception:
-                t = None
-            item = {
-                "country": e.get("country", "?"),
-                "event": e.get("event", "Unnamed event"),
-                "impact": e.get("impact", "?"),
-                "actual": e.get("actual"),
-                "estimate": e.get("estimate"),
-                "prev": e.get("prev"),
-                "time": t,
-            }
-            if t is None:
-                continue
-            if t <= now and item["actual"] is not None:
-                past.append(item)
-            elif t > now:
-                future.append(item)
-        past.sort(key=lambda x: x["time"], reverse=True)
-        future.sort(key=lambda x: x["time"])
-        return past, future, None
-    except Exception as e:
-        return [], [], f"{type(e).__name__}: {e}"
+            now = datetime.datetime.utcnow()
+            past, future = [], []
+            for e in events:
+                t_raw = e.get("time")
+                try:
+                    t = datetime.datetime.fromisoformat(t_raw.replace("Z", "")) if t_raw else None
+                except Exception:
+                    t = None
+                item = {
+                    "country": e.get("country", "?"), "event": e.get("event", "Unnamed event"),
+                    "impact": e.get("impact", "?"), "actual": e.get("actual"),
+                    "estimate": e.get("estimate"), "prev": e.get("prev"), "time": t,
+                }
+                if t is None:
+                    continue
+                if t <= now and item["actual"] is not None:
+                    past.append(item)
+                elif t > now:
+                    future.append(item)
+            past.sort(key=lambda x: x["time"], reverse=True)
+            future.sort(key=lambda x: x["time"])
+            return past, future, None, "finnhub"
+        except Exception as e:
+            # Fall through to zero-key rather than showing a dead section.
+            past = build_zero_key_past_events()
+            future = build_zero_key_future_events()
+            return past, future, f"Finnhub failed ({e}), showing zero-key fallback instead.", "zero_key"
+
+    # No key configured -- zero-key path runs by default, not as an error.
+    past = build_zero_key_past_events()
+    future = build_zero_key_future_events()
+    return past, future, None, "zero_key"
 
 
 def filter_calendar_for_pair(past, future, pair, impact_filter=("high", "medium")):
@@ -890,7 +981,7 @@ with st.sidebar:
     st.write("---")
     st.markdown("**API key status**")
     st.markdown(f"{'🟢' if not USING_DEMO_KEY else '🟡'} Twelve Data: {'configured' if not USING_DEMO_KEY else 'using shared demo key'}")
-    st.markdown(f"{'🟢' if FINNHUB_API_KEY else '🔴'} Finnhub (calendar): {'configured' if FINNHUB_API_KEY else 'not set'}")
+    st.markdown(f"{'🟢' if FINNHUB_API_KEY else '🟡'} Calendar: {'Finnhub full feed' if FINNHUB_API_KEY else 'zero-key (CB meeting dates + RSS data)'}")
     st.markdown(f"{'🟢' if ALPHAVANTAGE_API_KEY else '🟡'} News/sentiment: {'Alpha Vantage ML' if ALPHAVANTAGE_API_KEY else 'RSS + heuristic (no key needed)'}")
 
 spot = fetch_spot_rates()
@@ -952,58 +1043,73 @@ m = MACRO_INTELLIGENCE_MATRIX[selected_pair]
 
 # --- Tier 1: live scheduled-data (economic calendar) ---
 st.markdown("### 📅 Live Economic Calendar")
-past_events, future_events, cal_err = fetch_economic_calendar()
+past_events, future_events, cal_err, cal_source = fetch_economic_calendar()
 if cal_err:
     st.warning(cal_err)
-else:
-    p_events, f_events = filter_calendar_for_pair(past_events, future_events, selected_pair)
 
-    snapshot = {}
+p_events, f_events = filter_calendar_for_pair(past_events, future_events, selected_pair)
+
+snapshot = {}
+if p_events:
+    latest = p_events[0]
+    snapshot["last_actual"] = f"{latest['country']} {latest['event']}: {latest['actual']}"
+if f_events:
+    nxt = f_events[0]
+    snapshot["next_event"] = f"{nxt['country']} {nxt['event']} @ {nxt['time']}"
+changes = get_delta_baseline(selected_pair, snapshot)
+
+cal_col1, cal_col2 = st.columns(2)
+with cal_col1:
+    st.markdown("**Recent releases (actual vs. estimate)**")
     if p_events:
-        latest = p_events[0]
-        snapshot["last_actual"] = f"{latest['country']} {latest['event']}: {latest['actual']}"
+        for e in p_events[:5]:
+            surprise = ""
+            try:
+                if e["actual"] is not None and e["estimate"] is not None:
+                    diff = float(re.sub(r"[^\d\.\-+]", "", str(e["actual"]))) - float(re.sub(r"[^\d\.\-+]", "", str(e["estimate"])))
+                    surprise = " 🔺 beat" if diff > 0 else (" 🔻 miss" if diff < 0 else " ➖ in-line")
+            except Exception:
+                pass
+            est_part = f" vs est. {e['estimate']}" if e["estimate"] is not None else ""
+            st.markdown(
+                f"- `{e['time'].strftime('%Y-%m-%d')}` **{e['country']}** {e['event']}: "
+                f"actual **{e['actual']}**{est_part}{surprise}"
+            )
+    else:
+        st.caption("No recent high/medium-impact releases found for this pair's countries.")
+with cal_col2:
+    st.markdown("**Upcoming events (next binary risk)**")
     if f_events:
-        nxt = f_events[0]
-        snapshot["next_event"] = f"{nxt['country']} {nxt['event']} @ {nxt['time']}"
-    changes = get_delta_baseline(selected_pair, snapshot)
+        for e in f_events[:5]:
+            days_out = (e["time"] - datetime.datetime.utcnow()).days
+            extra_bits = [f"prior: {e['prev']}" if e["prev"] is not None else None,
+                          f"est.: {e['estimate']}" if e["estimate"] is not None else None]
+            extra = ", ".join(b for b in extra_bits if b)
+            extra_str = f" -- {extra}" if extra else ""
+            st.markdown(
+                f"- in **{max(days_out, 0)}d** ({e['time'].strftime('%Y-%m-%d')}) "
+                f"**{e['country']}** {e['event']}{extra_str}"
+            )
+    else:
+        st.caption("No upcoming high/medium-impact events found in the next 45 days.")
 
-    cal_col1, cal_col2 = st.columns(2)
-    with cal_col1:
-        st.markdown("**Recent releases (actual vs. estimate)**")
-        if p_events:
-            for e in p_events[:5]:
-                surprise = ""
-                try:
-                    if e["actual"] is not None and e["estimate"] is not None:
-                        diff = float(e["actual"]) - float(e["estimate"])
-                        surprise = " 🔺 beat" if diff > 0 else (" 🔻 miss" if diff < 0 else " ➖ in-line")
-                except Exception:
-                    pass
-                st.markdown(
-                    f"- `{e['time'].strftime('%Y-%m-%d')}` **{e['country']}** {e['event']}: "
-                    f"actual **{e['actual']}** vs est. {e['estimate']}{surprise}"
-                )
-        else:
-            st.caption("No recent high/medium-impact releases found for this pair's countries.")
-    with cal_col2:
-        st.markdown("**Upcoming events (next binary risk)**")
-        if f_events:
-            for e in f_events[:5]:
-                days_out = (e["time"] - datetime.datetime.utcnow()).days
-                st.markdown(
-                    f"- in **{max(days_out, 0)}d** ({e['time'].strftime('%Y-%m-%d')}) "
-                    f"**{e['country']}** {e['event']} -- prior: {e['prev']}, est.: {e['estimate']}"
-                )
-        else:
-            st.caption("No upcoming high/medium-impact events found in the next 45 days.")
+if changes:
+    st.success("🔄 **Changed since you opened this session:**\n\n" + "\n".join(f"- {c}" for c in changes))
 
-    if changes:
-        st.success("🔄 **Changed since you opened this session:**\n\n" + "\n".join(f"- {c}" for c in changes))
-
-st.caption(
-    "Source: Finnhub economic calendar, filtered to high/medium-impact releases for "
-    "this pair's two currencies. This is genuinely live -- refetched every 30 minutes."
-)
+if cal_source == "finnhub":
+    st.caption(
+        "Source: Finnhub economic calendar (full multi-event feed), filtered to "
+        "high/medium-impact releases for this pair's two currencies. Refetched every 30 minutes."
+    )
+else:
+    st.caption(
+        f"Source: zero-key fallback -- 'Upcoming' is each relevant central bank's next "
+        f"confirmed meeting date (published officially, reference table verified "
+        f"{CENTRAL_BANK_MEETING_DATES_VERIFIED_AS_OF}); 'Recent releases' are actual-vs-"
+        f"estimate figures extracted directly from the same RSS news feed used in News & "
+        f"Sentiment below, at no extra API cost. Add FINNHUB_API_KEY in Secrets for a "
+        f"fuller multi-event calendar (CPI, NFP, GDP, etc.) instead of just central bank dates."
+    )
 
 st.write("---")
 
