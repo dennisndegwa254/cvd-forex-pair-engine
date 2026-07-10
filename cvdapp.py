@@ -489,6 +489,43 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
+_DATA_POINT_RE = re.compile(
+    r"^(?P<event>.+?)\s+"
+    r"(?P<actual>[+-]?\d[\d,]*\.?\d*\s?[%mMbBkK]?)\s*"
+    r"vs\.?\s*"
+    r"(?P<expected>[+-]?\d[\d,]*\.?\d*\s?[%mMbBkK]?)\s*"
+    r"(?:expected|exp\.?|forecast(?:ed)?)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_metric_value(raw: str):
+    s = raw.replace(",", "").strip()
+    m = re.match(r"^([+-]?\d+\.?\d*)\s*([%mMbBkK]?)$", s)
+    if not m:
+        return None
+    return float(m.group(1)), m.group(2).lower()
+
+
+def extract_data_point(title: str):
+    """
+    Pulls a real actual-vs-expected data point straight out of a headline like
+    'US June existing home sales 4.09m vs 4.20m expected' -- returns a dict of
+    structured fields (event, actual, expected, surprise) instead of leaving
+    it buried in prose, or None if the headline doesn't contain this pattern.
+    """
+    m = _DATA_POINT_RE.match(title.strip())
+    if not m:
+        return None
+    event = m.group("event").strip(" -:")
+    actual_raw, expected_raw = m.group("actual").strip(), m.group("expected").strip()
+    a, e = _parse_metric_value(actual_raw), _parse_metric_value(expected_raw)
+    surprise = None
+    if a and e and a[1] == e[1]:
+        surprise = "beat" if a[0] > e[0] else ("miss" if a[0] < e[0] else "in-line")
+    return {"event": event, "actual": actual_raw, "expected": expected_raw, "surprise": surprise}
+
+
 def extract_insight(raw_html_or_text: str, max_sentences: int = 2, max_chars: int = 220) -> str:
     """
     Turns a raw RSS <description> (often full of HTML markup, style attributes,
@@ -509,6 +546,39 @@ def extract_insight(raw_html_or_text: str, max_sentences: int = 2, max_chars: in
     return snippet
 
 
+# --- Numeric data-point extraction ---
+# Pulls actual figures straight out of headline/summary text instead of
+# making you read prose to find the number. Regex-based, not NLP -- it only
+# surfaces what's actually written in the text, never infers or estimates.
+_ACTUAL_VS_EXPECTED_RE = re.compile(
+    r"([-+]?\d+(?:\.\d+)?\s?[a-zA-Z%]{0,3})\s+(?:vs\.?|versus)\s+"
+    r"([-+]?\d+(?:\.\d+)?\s?[a-zA-Z%]{0,3})\s+expected",
+    re.IGNORECASE,
+)
+_BASIS_POINT_RE = re.compile(r"(\d{1,3})[\s-]*(?:basis[\s-]*point|bp)s?", re.IGNORECASE)
+_PERCENT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?\s?%")
+_PRIOR_RE = re.compile(r"prior(?:\s+was)?\s+([-+]?\d+(?:\.\d+)?\s?[a-zA-Z%]{0,3})", re.IGNORECASE)
+
+
+def extract_data_points(text: str) -> list:
+    """Returns a list of short structured strings like 'Actual 4.09m vs Expected 4.20m'."""
+    if not text:
+        return []
+    points = []
+    for m in _ACTUAL_VS_EXPECTED_RE.finditer(text):
+        points.append(f"Actual {m.group(1).strip()} vs Expected {m.group(2).strip()}")
+    for m in _BASIS_POINT_RE.finditer(text):
+        points.append(f"Rate move: {m.group(1)}bp")
+    prior_matches = _PRIOR_RE.findall(text)
+    for p in prior_matches[:2]:
+        points.append(f"Prior: {p.strip()}")
+    if not points:
+        pcts = list(dict.fromkeys(_PERCENT_RE.findall(text)))[:4]
+        if pcts:
+            points.append("Figures mentioned: " + ", ".join(p.strip() for p in pcts))
+    return points
+
+
 @st.cache_data(ttl=1800)
 def fetch_rss_articles():
     """Zero-key fetch across all configured public RSS feeds. Skips any feed
@@ -526,9 +596,11 @@ def fetch_rss_articles():
                 pub = (item.findtext("pubDate") or "").strip()
                 raw_desc = (item.findtext("description") or "").strip()
                 if title:
+                    clean_summary = extract_insight(raw_desc)
                     articles.append({
                         "title": title, "url": link, "time_published": pub,
-                        "summary": extract_insight(raw_desc), "source": source_name,
+                        "summary": clean_summary, "source": source_name,
+                        "data_points": extract_data_points(title + " " + clean_summary),
                     })
         except Exception:
             continue  # one broken feed shouldn't take down the others
@@ -563,15 +635,18 @@ def fetch_news_sentiment_av(pair: str):
         feed = payload.get("feed", [])
         articles = []
         for item in feed[:8]:
+            av_title = item.get("title", "Untitled")
+            av_summary = extract_insight(item.get("summary", ""))
             articles.append({
-                "title": item.get("title", "Untitled"),
+                "title": av_title,
                 "source": item.get("source", "Unknown source"),
                 "url": item.get("url", ""),
                 "time_published": item.get("time_published", ""),
-                "summary": extract_insight(item.get("summary", "")),
+                "summary": av_summary,
                 "sentiment_score": item.get("overall_sentiment_score"),
                 "sentiment_label": item.get("overall_sentiment_label", "Neutral"),
                 "mode": "ml",
+                "data_points": extract_data_points(av_title + " " + av_summary),
             })
         return articles, None
     except Exception as e:
@@ -601,6 +676,7 @@ def fetch_news_sentiment(pair: str):
             "title": a["title"], "source": a["source"], "url": a["url"],
             "time_published": a["time_published"], "summary": a["summary"],
             "sentiment_score": score, "sentiment_label": label, "mode": "heuristic",
+            "data_points": a.get("data_points", []),
         })
     return articles, None, "heuristic"
 
@@ -1005,22 +1081,38 @@ elif not articles:
 else:
     if mode == "heuristic":
         st.caption(
-            "⚠️ Sentiment labels below are a simple keyword heuristic (counts "
+            "⚠️ Sentiment labels are a simple keyword heuristic (counts "
             "hawkish/dovish/bullish/bearish terms), not ML-based scoring -- treat "
             "them as a rough read, not a precise signal."
         )
+
+    data_rows, plain_headlines = [], []
     for a in articles:
-        score = a["sentiment_score"]
-        label = a["sentiment_label"]
-        emoji = "🟢" if "Bullish" in label else ("🔴" if "Bearish" in label else "⚪")
-        st.markdown(
-            f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} "
-            f"({a['time_published'][:16]})"
-        )
-        insight = a["summary"].strip()
-        if insight:
-            st.caption(f"Sentiment: {label} ({score}) -- {insight}")
+        dp = extract_data_point(a["title"])
+        if dp:
+            data_rows.append({
+                "Event": dp["event"],
+                "Actual": dp["actual"],
+                "Expected": dp["expected"],
+                "Surprise": {"beat": "🔺 Beat", "miss": "🔻 Miss", "in-line": "➖ In-line"}.get(dp["surprise"], "?"),
+                "Sentiment": a["sentiment_label"],
+                "Time": a["time_published"][:16],
+                "Source": a["source"],
+            })
         else:
+            plain_headlines.append(a)
+
+    if data_rows:
+        st.markdown("**📊 Data points extracted directly from headlines**")
+        st.dataframe(pd.DataFrame(data_rows), hide_index=True, use_container_width=True)
+
+    if plain_headlines:
+        st.markdown("**📰 Other headlines (no extractable actual-vs-expected figure)**")
+        for a in plain_headlines:
+            score = a["sentiment_score"]
+            label = a["sentiment_label"]
+            emoji = "🟢" if "Bullish" in label else ("🔴" if "Bearish" in label else "⚪")
+            st.markdown(f"{emoji} **[{a['title']}]({a['url']})** -- {a['source']} ({a['time_published'][:16]})")
             st.caption(f"Sentiment: {label} ({score})")
 
 st.write("---")
