@@ -414,24 +414,37 @@ def build_zero_key_future_events(reference_date=None):
     return events
 
 
+_CURRENCY_CHECK_ORDER = ["EUR", "GBP", "JPY", "AUD", "USD"]  # USD last -- see currency_strength_direction()
+
+
+def _attribute_country(text_l: str):
+    """Same ambiguous-'dollar' fix as currency_strength_direction: checks
+    unambiguous currency phrases before USD's generic 'dollar' keyword."""
+    for cur in _CURRENCY_CHECK_ORDER:
+        kws = CURRENCY_KEYWORDS.get(cur, [])
+        if any(k in text_l for k in kws):
+            return CURRENCY_TO_COUNTRY.get(cur), cur
+    return None, None
+
+
 def build_zero_key_past_events():
-    """Reuses the RSS feed already fetched for News & Sentiment -- pulls out
-    any headline with a real actual-vs-expected figure via the same
-    extract_data_point used there, so this costs zero extra requests."""
-    articles = fetch_rss_articles()
+    """Reuses the RSS feed already fetched for News & Sentiment.
+    Two kinds of entries, both zero-cost:
+      - Hard data points: any headline with a real actual-vs-expected figure,
+        via the same extract_data_point used in News & Sentiment.
+      - Narrative entries: headlines that are clearly about one of the pair's
+        currencies but DON'T have an extractable number (a testimony, a
+        political-comment reaction, a policy-plan headline). These used to
+        vanish from the calendar tier entirely even on days they mattered --
+        now they show up tagged as 'narrative' with a directional read where
+        one is detectable, instead of only appearing in the News section."""
+    articles, _ = fetch_rss_articles()
     events = []
     for a in articles:
-        dp = extract_data_point(a["title"])
-        if dp is None:
-            continue
         text_l = (a["title"] + " " + a["summary"]).lower()
-        country = None
-        for cur, kws in CURRENCY_KEYWORDS.items():
-            if any(k in text_l for k in kws):
-                country = CURRENCY_TO_COUNTRY.get(cur)
-                break
+        country, cur = _attribute_country(text_l)
         if country is None:
-            continue  # can't confidently attribute this to a currency/country
+            continue
         try:
             t = email.utils.parsedate_to_datetime(a["time_published"])
             if t.tzinfo is not None:
@@ -440,9 +453,25 @@ def build_zero_key_past_events():
             t = None
         if t is None:
             continue
+
+        dp = extract_data_point(a["title"])
+        if dp is not None:
+            events.append({
+                "country": country, "event": dp["event"], "impact": "medium",
+                "actual": dp["actual"], "estimate": dp["expected"], "prev": None, "time": t,
+            })
+            continue
+
+        # Narrative fallback: no hard number, but currency-relevant.
+        is_stronger = any(re.search(w, text_l) for w in _STRENGTH_WORDS)
+        is_weaker = any(re.search(w, text_l) for w in _WEAKNESS_WORDS)
+        direction = "Strengthening" if (is_stronger and not is_weaker) else (
+            "Weakening" if (is_weaker and not is_stronger) else None
+        )
         events.append({
-            "country": country, "event": dp["event"], "impact": "medium",
-            "actual": dp["actual"], "estimate": dp["expected"], "prev": None, "time": t,
+            "country": country, "event": a["title"], "impact": "narrative",
+            "actual": None, "estimate": None, "prev": None, "time": t,
+            "direction": direction, "currency": cur,
         })
     events.sort(key=lambda x: x["time"], reverse=True)
     return events
@@ -450,9 +479,14 @@ def build_zero_key_past_events():
 
 @st.cache_data(ttl=1800)  # calendar data doesn't need to refresh every 45s
 def fetch_economic_calendar():
-    """Returns (past_events, future_events, error, source). source is
-    'finnhub' or 'zero_key'. error is only set for genuine failures --
-    the zero-key path is a normal operating mode, not an error state."""
+    """Returns (past_events, future_events, error, source, fetched_at).
+    source is 'finnhub' or 'zero_key'. error is only set for genuine
+    failures -- the zero-key path is a normal operating mode, not an error
+    state. fetched_at is captured at the moment of the real fetch (this
+    function only actually runs on a cache miss, every 30 min) -- it lets
+    the UI show truthfully how stale this specific tier is on any given
+    auto-refresh tick, instead of implying everything just updated."""
+    fetched_at = datetime.datetime.utcnow()
     if FINNHUB_API_KEY:
         try:
             today = datetime.date.today()
@@ -495,20 +529,20 @@ def fetch_economic_calendar():
                     future.append(item)
             past.sort(key=lambda x: x["time"], reverse=True)
             future.sort(key=lambda x: x["time"])
-            return past, future, None, "finnhub"
+            return past, future, None, "finnhub", fetched_at
         except Exception as e:
             # Fall through to zero-key rather than showing a dead section.
             past = build_zero_key_past_events()
             future = build_zero_key_future_events()
-            return past, future, f"Finnhub failed ({e}), showing zero-key fallback instead.", "zero_key"
+            return past, future, f"Finnhub failed ({e}), showing zero-key fallback instead.", "zero_key", fetched_at
 
     # No key configured -- zero-key path runs by default, not as an error.
     past = build_zero_key_past_events()
     future = build_zero_key_future_events()
-    return past, future, None, "zero_key"
+    return past, future, None, "zero_key", fetched_at
 
 
-def filter_calendar_for_pair(past, future, pair, impact_filter=("high", "medium")):
+def filter_calendar_for_pair(past, future, pair, impact_filter=("high", "medium", "narrative")):
     countries = PAIR_COUNTRIES.get(pair, [])
     imp = {i.lower() for i in impact_filter}
     p = [e for e in past if e["country"] in countries and str(e["impact"]).lower() in imp]
@@ -547,12 +581,73 @@ _BULLISH_WORDS = [
     "hike", "hikes", "hiking", "hawkish", "rally", "rallies", "surge", "surges",
     "strengthen", "strengthens", "gains", "tighten", "tightening", "raise rates",
     "beats expectations", "stronger than expected", "upside surprise",
+    # v2 additions: qualitative/statement-type hawkish language that was
+    # previously invisible to the heuristic (e.g. Fed testimony wording)
+    "stepped up inflation", "inflation risk", "price pressures", "sticky inflation",
+    "hawkish tilt", "rate hike odds", "tightening bias", "inflation concern",
+    "warns of inflation", "elevated inflation",
 ]
 _BEARISH_WORDS = [
     "cut", "cuts", "cutting", "dovish", "plunge", "plunges", "slump", "slumps",
     "weaken", "weakens", "losses", "ease", "easing", "recession", "slowdown",
     "misses expectations", "weaker than expected", "downside surprise",
+    # v2 additions
+    "inflation cools", "disinflation", "soft data", "labor market cooling",
+    "dovish tilt", "rate cut odds", "easing bias", "weaker outlook",
 ]
+
+# Generic price-action verbs used constantly in ForexLive/Investing-style
+# headlines (e.g. "USD moves higher", "Yen surges", "Canadian dollar rises").
+# These say a SPECIFIC currency strengthened/weakened -- on their own they're
+# not bullish/bearish for a PAIR until you know which of the pair's two
+# currencies is doing the moving (USD strengthening is EURUSD-bearish but
+# USDJPY-bullish). See currency_strength_direction() below.
+_STRENGTH_WORDS = ["moves higher", "rises", "rallies", "climbs", "gains ground",
+                   "strengthens", "surges", "higher", "heads for.*gain", "firms"]
+_WEAKNESS_WORDS = ["moves lower", "falls", "declines", "slides", "weakens",
+                   "drops", "lower", "heads for.*loss", "softens"]
+
+# Statement/testimony-type language: if one of these appears WITHOUT a clear
+# directional word also present, the heuristic should say so explicitly
+# rather than silently defaulting to a flat "Neutral" that looks the same as
+# "nothing relevant happened here."
+_QUALITATIVE_MARKERS = [
+    "testimony", "comments on", "comments about", "sees ", "warns", "cautions",
+    "signals", "hints at", "pledges", "reiterates", "flags", "raises concern",
+    "opens door to", "rules out", "reacts to", "reaction to", "says the",
+]
+
+
+def currency_strength_direction(text: str, pair: str):
+    """
+    Pair-aware directional read: finds which currency a strength/weakness verb
+    is describing, then translates that into a Bullish/Bearish call for the
+    SELECTED PAIR specifically -- e.g. 'USD moves higher' is Bearish for
+    EURUSD (USD is the quote currency) but Bullish for USDJPY (USD is the
+    base currency). Returns None if no currency+direction phrase is found.
+
+    Checks EUR/GBP/JPY/AUD before USD deliberately: USD's keyword list
+    includes the bare word "dollar", which is also part of "Australian
+    dollar", "Canadian dollar", etc. Checking the more specific currency
+    phrases first avoids misreading "Australian dollar rises" as USD
+    strength (which would flip the direction call for AUDUSD).
+    """
+    base, quote = pair[:3], pair[3:]
+    t = text.lower()
+    check_order = ["EUR", "GBP", "JPY", "AUD", "USD"]
+    for cur in check_order:
+        if cur not in (base, quote):
+            continue
+        kws = CURRENCY_KEYWORDS.get(cur, [])
+        if not any(k in t for k in kws):
+            continue
+        is_stronger = any(re.search(w, t) for w in _STRENGTH_WORDS)
+        is_weaker = any(re.search(w, t) for w in _WEAKNESS_WORDS)
+        if is_stronger and not is_weaker:
+            return "Bullish" if cur == base else "Bearish"
+        if is_weaker and not is_stronger:
+            return "Bearish" if cur == base else "Bullish"
+    return None
 
 
 def keyword_sentiment(text: str):
@@ -572,6 +667,29 @@ def keyword_sentiment(text: str):
         label = "Somewhat-Bearish (heuristic)"
     else:
         label = "Bearish (heuristic)"
+    return score, label
+
+
+def pair_aware_sentiment(text: str, pair: str):
+    """
+    Upgraded sentiment call used by the news feed: tries the pair-aware
+    currency-strength read first (most accurate, since it's pair-specific),
+    falls back to the generic keyword count, and -- this is the fix for the
+    'Fed testimony / Trump comments' gap -- explicitly labels a headline as
+    an unscored qualitative statement rather than quietly calling it flat
+    Neutral when it contains statement-type language the heuristic can't
+    confidently direction-call.
+    """
+    strength_dir = currency_strength_direction(text, pair)
+    if strength_dir:
+        score = 2 if strength_dir == "Bullish" else -2
+        return score, f"{strength_dir} (heuristic, currency-strength read)"
+
+    score, label = keyword_sentiment(text)
+    if score == 0:
+        t = text.lower()
+        if any(m in t for m in _QUALITATIVE_MARKERS):
+            return score, "Neutral (heuristic) -- qualitative statement, read manually"
     return score, label
 
 
@@ -673,7 +791,10 @@ def extract_data_points(text: str) -> list:
 @st.cache_data(ttl=1800)
 def fetch_rss_articles():
     """Zero-key fetch across all configured public RSS feeds. Skips any feed
-    that fails rather than erroring out the whole section."""
+    that fails rather than erroring out the whole section. Returns
+    (articles, fetched_at) -- fetched_at is real (only set on a cache miss),
+    so the UI can show truthfully how stale this feed actually is."""
+    fetched_at = datetime.datetime.utcnow()
     articles = []
     for source_name, url in RSS_NEWS_FEEDS:
         try:
@@ -695,7 +816,7 @@ def fetch_rss_articles():
                     })
         except Exception:
             continue  # one broken feed shouldn't take down the others
-    return articles
+    return articles, fetched_at
 
 
 
@@ -708,7 +829,9 @@ def filter_articles_for_pair(articles, pair):
 
 @st.cache_data(ttl=6 * 3600)
 def fetch_news_sentiment_av(pair: str):
-    """Alpha Vantage path -- real ML sentiment, but quota-limited to 25/day."""
+    """Alpha Vantage path -- real ML sentiment, but quota-limited to 25/day.
+    Returns (articles, error, fetched_at)."""
+    fetched_at = datetime.datetime.utcnow()
     try:
         resp = requests.get(
             "https://www.alphavantage.co/query",
@@ -722,7 +845,7 @@ def fetch_news_sentiment_av(pair: str):
         )
         payload = resp.json()
         if "Note" in payload or "Information" in payload:
-            return [], f"Alpha Vantage quota message: {payload.get('Note') or payload.get('Information')}"
+            return [], f"Alpha Vantage quota message: {payload.get('Note') or payload.get('Information')}", fetched_at
         feed = payload.get("feed", [])
         articles = []
         for item in feed[:8]:
@@ -739,37 +862,39 @@ def fetch_news_sentiment_av(pair: str):
                 "mode": "ml",
                 "data_points": extract_data_points(av_title + " " + av_summary),
             })
-        return articles, None
+        return articles, None, fetched_at
     except Exception as e:
-        return [], f"{type(e).__name__}: {e}"
+        return [], f"{type(e).__name__}: {e}", fetched_at
 
 
 def fetch_news_sentiment(pair: str):
     """
-    Returns (list_of_articles, error, mode) where mode is 'ml' (Alpha Vantage)
-    or 'heuristic' (zero-key RSS fallback). Auto-selects based on whether a
-    key is configured -- the section works immediately either way.
+    Returns (list_of_articles, error, mode, fetched_at) where mode is 'ml'
+    (Alpha Vantage) or 'heuristic' (zero-key RSS fallback). Auto-selects
+    based on whether a key is configured -- the section works immediately
+    either way. fetched_at reflects the real underlying fetch time (from
+    whichever cached sub-function actually ran), not just "now".
     """
     if ALPHAVANTAGE_API_KEY:
-        articles, err = fetch_news_sentiment_av(pair)
+        articles, err, fetched_at = fetch_news_sentiment_av(pair)
         if articles or err is None:
-            return articles, err, "ml"
+            return articles, err, "ml", fetched_at
         # fall through to RSS if AV fails for any reason
 
-    raw = fetch_rss_articles()
+    raw, fetched_at = fetch_rss_articles()
     if not raw:
-        return [], "Both the Alpha Vantage and RSS fallback paths returned nothing -- check network/outbound access.", "heuristic"
+        return [], "Both the Alpha Vantage and RSS fallback paths returned nothing -- check network/outbound access.", "heuristic", fetched_at
     relevant = filter_articles_for_pair(raw, pair)
     articles = []
     for a in relevant[:8]:
-        score, label = keyword_sentiment(a["title"] + " " + a["summary"])
+        score, label = pair_aware_sentiment(a["title"] + " " + a["summary"], pair)
         articles.append({
             "title": a["title"], "source": a["source"], "url": a["url"],
             "time_published": a["time_published"], "summary": a["summary"],
             "sentiment_score": score, "sentiment_label": label, "mode": "heuristic",
             "data_points": a.get("data_points", []),
         })
-    return articles, None, "heuristic"
+    return articles, None, "heuristic", fetched_at
 
 
 # ==========================================
@@ -780,9 +905,11 @@ def fetch_news_sentiment(pair: str):
 # diff, not a permanent history log.
 # ==========================================
 def freshness_badge(as_of: datetime.datetime, warn_hours=24, stale_hours=168):
-    age_hours = (datetime.datetime.utcnow() - as_of).total_seconds() / 3600
+    age_seconds = (datetime.datetime.utcnow() - as_of).total_seconds()
+    age_hours = age_seconds / 3600
     if age_hours < warn_hours:
-        return f"🟢 fetched {age_hours:.0f}h ago"
+        age_str = f"{age_seconds / 60:.0f}m ago" if age_hours < 1 else f"{age_hours:.0f}h ago"
+        return f"🟢 fetched {age_str}"
     elif age_hours < stale_hours:
         return f"🟡 fetched {age_hours / 24:.0f}d ago -- verify before relying on this"
     else:
@@ -873,15 +1000,23 @@ def fetch_td_bars(symbol: str, interval: str, outputsize: int):
         return None, f"{type(e).__name__}: {e}"
 
 
-def compute_cvd_proxy(df: pd.DataFrame, noise_atr_fraction: float = 0.15, atr_period: int = 14):
+def compute_cvd_proxy(df: pd.DataFrame, noise_percentile: float = 0.20, atr_period: int = 14):
     """
     Cumulative Volume Delta. Auto-detects whether the feed actually provides
     non-zero volume for this symbol:
       - Real volume present -> CVD = cumulative sum of signed volume per bar.
       - Volume entirely zero/missing -> falls back to a tick-direction proxy
         (each bar contributes +1/-1), clearly flagged via 'volume_mode'.
-    Noise filter: bars whose (high-low) range is below noise_atr_fraction *
-    rolling ATR are zeroed out of the cumulative line (chop suppression).
+
+    Noise filter: bars whose (high-low) range falls at or below the
+    `noise_percentile` quantile of THIS series' own range distribution are
+    zeroed out of the cumulative line (chop suppression). This replaces a
+    fixed "15% of ATR" constant, which produced wildly different filter rates
+    across pairs/timeframes (as low as 2% filtered on some combinations,
+    doing almost nothing) -- a percentile threshold self-calibrates to each
+    pair and timeframe's own volatility scale, so noise_percentile=0.20
+    reliably filters ~20% of bars on EURUSD 30m just as much as on AUDUSD 1d,
+    regardless of how different their raw ATR values are.
     """
     if df is None or len(df) < atr_period + 2:
         return None
@@ -894,7 +1029,8 @@ def compute_cvd_proxy(df: pd.DataFrame, noise_atr_fraction: float = 0.15, atr_pe
     has_real_volume = d["Volume"].abs().sum() > 0
     magnitude = d["Volume"] if has_real_volume else pd.Series(1.0, index=d.index)
 
-    noise_mask = d["range"] < (noise_atr_fraction * d["atr"])
+    noise_threshold = d["range"].quantile(noise_percentile)
+    noise_mask = d["range"] <= noise_threshold
     signed = d["direction"] * magnitude
     signed[noise_mask] = 0.0
     d["signed_vol"] = signed
@@ -968,9 +1104,11 @@ with st.sidebar:
     st.header("Configuration")
     selected_pair = st.selectbox("Trading pair", MAJOR_PAIRS)
     noise_pct = st.slider(
-        "Noise filter strength (% of ATR)", min_value=0, max_value=50, value=15, step=5,
-        help="Bars with a range below this fraction of the rolling ATR are treated as chop "
-             "and contribute zero to the cumulative delta line.",
+        "Noise filter: bottom X% of bars (by range) treated as chop", min_value=0, max_value=50, value=20, step=5,
+        help="Self-calibrating per pair/timeframe: the smallest-range X% of bars in "
+             "THIS series contribute zero to the cumulative delta line, rather than a "
+             "fixed ATR fraction (which filtered as little as 2% on some pairs and "
+             "did almost nothing).",
     )
     auto_refresh = st.checkbox("Auto-refresh", value=True)
     st.write("---")
@@ -1010,7 +1148,7 @@ cvd_summaries_by_tf = {}  # captured here for reuse in the fundamentals synthesi
 for tf, tab in zip(TIMEFRAMES, tf_tabs):
     with tab:
         raw_result = all_cvd.get(tf)
-        d = compute_cvd_proxy(raw_result, noise_atr_fraction=noise_pct / 100.0) if raw_result is not None else None
+        d = compute_cvd_proxy(raw_result, noise_percentile=noise_pct / 100.0) if raw_result is not None else None
         if d is None or d.empty:
             st.warning(
                 f"No {tf} data available right now. Not substituting synthetic data -- "
@@ -1046,7 +1184,7 @@ m = MACRO_INTELLIGENCE_MATRIX[selected_pair]
 # Fetched once here and reused by both the synthesis box below and the Live
 # Economic Calendar tier further down -- st.cache_data makes the second call
 # free, this just keeps the data available where it's needed first.
-past_events, future_events, cal_err, cal_source = fetch_economic_calendar()
+past_events, future_events, cal_err, cal_source, cal_fetched_at = fetch_economic_calendar()
 p_events_syn, f_events_syn = filter_calendar_for_pair(past_events, future_events, selected_pair)
 
 # News input to the synthesis: safe to auto-fetch only when it costs nothing
@@ -1059,21 +1197,38 @@ if ALPHAVANTAGE_API_KEY:
         st.session_state[_news_key_syn][0], st.session_state[_news_key_syn][2]
     ) if _news_key_syn in st.session_state else ([], None)
 else:
-    syn_articles, _, syn_news_mode = fetch_news_sentiment(selected_pair)
+    syn_articles, _, syn_news_mode, _ = fetch_news_sentiment(selected_pair)
 
 
 def synthesize_pair_view(pair, cal_past, cal_future, cvd_by_tf, news_articles, news_mode, bias_label):
     """
     Builds a live 'what this actually means right now' comment for the
     selected pair from whatever data was actually fetched this run -- not a
-    canned narrative. Each line is only included if real data supports it,
-    and the closing line tallies how many of the live signals agree or
-    disagree with the static analyst bias above, rather than asserting a
-    verdict.
+    canned narrative. Each line is only included if real data supports it.
+
+    Tally logic: every component that's checked against the bias lands in
+    exactly one bucket -- agree, disagree, or inconclusive (a genuine tie,
+    e.g. CVD split evenly bullish/bearish across timeframes). Earlier
+    versions counted a component toward the denominator without landing it
+    in agree or disagree, so a tie silently vanished into the ratio (e.g.
+    '1/2 align' didn't reveal that the missing half was a tied/contradictory
+    reading rather than simple absence of data). Ties are now named
+    explicitly, both inline per component and in the bottom-line tally.
     """
     bias_dir = "Bullish" if "Bullish" in bias_label else ("Bearish" if "Bearish" in bias_label else None)
     lines = []
-    agree, disagree, total_signals = 0, 0, 0
+    agree, disagree, inconclusive = 0, 0, 0
+
+    def _tally(component_dir):
+        nonlocal agree, disagree, inconclusive
+        if bias_dir is None:
+            return
+        if component_dir is None:
+            inconclusive += 1
+        elif component_dir == bias_dir:
+            agree += 1
+        else:
+            disagree += 1
 
     # Recent data-release surprises
     beats = misses = inline = 0
@@ -1093,17 +1248,13 @@ def synthesize_pair_view(pair, cal_past, cal_future, cvd_by_tf, news_articles, n
             continue
     if beats or misses:
         lean = "upside" if beats > misses else ("downside" if misses > beats else "mixed")
+        tie_note = " -- **tied, no clean lean**" if lean == "mixed" else ""
         lines.append(
-            f"📊 Recent releases for this pair have leaned **{lean}** "
+            f"📊 Recent releases for this pair have leaned **{lean}**{tie_note} "
             f"({beats} beat / {misses} miss / {inline} in-line, last {beats + misses + inline})."
         )
-        if bias_dir:
-            total_signals += 1
-            data_dir = "Bullish" if lean == "upside" else ("Bearish" if lean == "downside" else None)
-            if data_dir == bias_dir:
-                agree += 1
-            elif data_dir:
-                disagree += 1
+        data_dir = "Bullish" if lean == "upside" else ("Bearish" if lean == "downside" else None)
+        _tally(data_dir)
 
     # Next scheduled risk event
     if cal_future:
@@ -1115,20 +1266,24 @@ def synthesize_pair_view(pair, cal_past, cal_future, cvd_by_tf, news_articles, n
     if news_articles:
         bullish_n = sum(1 for a in news_articles if "Bullish" in a["sentiment_label"])
         bearish_n = sum(1 for a in news_articles if "Bearish" in a["sentiment_label"])
+        unscored_n = sum(1 for a in news_articles if "qualitative statement" in a["sentiment_label"])
         if bullish_n or bearish_n:
             news_lean = "bullish" if bullish_n > bearish_n else ("bearish" if bearish_n > bullish_n else "mixed")
+            tie_note = " -- **tied, no clean lean**" if news_lean == "mixed" else ""
             qualifier = "ML-scored" if news_mode == "ml" else "keyword-heuristic"
+            unscored_note = f", {unscored_n} unscored/qualitative" if unscored_n else ""
             lines.append(
-                f"📰 News sentiment ({qualifier}) skews **{news_lean}** "
-                f"({bullish_n} bullish / {bearish_n} bearish of {len(news_articles)} headlines)."
+                f"📰 News sentiment ({qualifier}) skews **{news_lean}**{tie_note} "
+                f"({bullish_n} bullish / {bearish_n} bearish of {len(news_articles)} headlines{unscored_note})."
             )
-            if bias_dir:
-                total_signals += 1
-                news_dir = "Bullish" if news_lean == "bullish" else ("Bearish" if news_lean == "bearish" else None)
-                if news_dir == bias_dir:
-                    agree += 1
-                elif news_dir:
-                    disagree += 1
+            news_dir = "Bullish" if news_lean == "bullish" else ("Bearish" if news_lean == "bearish" else None)
+            _tally(news_dir)
+        elif unscored_n:
+            lines.append(
+                f"📰 All {unscored_n} relevant headlines this run were qualitative statements "
+                f"(testimony/comments) the heuristic can't confidently direction-call -- "
+                f"read them manually rather than treating this as a silent Neutral."
+            )
     else:
         lines.append(
             "📰 No news sentiment included yet -- " + (
@@ -1142,25 +1297,27 @@ def synthesize_pair_view(pair, cal_past, cal_future, cvd_by_tf, news_articles, n
     if tf_biases:
         bull_tf = sum(1 for b in tf_biases.values() if "Bullish" in b)
         bear_tf = sum(1 for b in tf_biases.values() if "Bearish" in b)
+        tie_note = ""
+        if bull_tf == bear_tf and bull_tf > 0:
+            tie_note = " -- **internally split, no clean order-flow read this run**"
         lines.append(
             f"📈 Order-flow proxy (CVD) is bullish on {bull_tf}/{len(tf_biases)} timeframes "
-            f"and bearish on {bear_tf}/{len(tf_biases)}."
+            f"and bearish on {bear_tf}/{len(tf_biases)}{tie_note}."
         )
-        if bias_dir:
-            total_signals += 1
-            cvd_dir = "Bullish" if bull_tf > bear_tf else ("Bearish" if bear_tf > bull_tf else None)
-            if cvd_dir == bias_dir:
-                agree += 1
-            elif cvd_dir:
-                disagree += 1
+        cvd_dir = "Bullish" if bull_tf > bear_tf else ("Bearish" if bear_tf > bull_tf else None)
+        _tally(cvd_dir)
 
-    if bias_dir and total_signals:
-        if disagree == 0:
-            verdict = f"All {agree}/{total_signals} live signals checked align with the **{bias_dir}** analyst framework."
-        elif agree == 0:
-            verdict = f"All {disagree}/{total_signals} live signals checked run **against** the {bias_dir} analyst framework -- worth a closer look."
+    total_checked = agree + disagree + inconclusive
+    if bias_dir and total_checked:
+        parts = [f"{agree}/{total_checked} agree", f"{disagree}/{total_checked} disagree"]
+        if inconclusive:
+            parts.append(f"{inconclusive}/{total_checked} inconclusive/tied")
+        if disagree == 0 and inconclusive == 0:
+            verdict = f"All {agree}/{total_checked} live signals checked align with the **{bias_dir}** analyst framework."
+        elif agree == 0 and inconclusive == 0:
+            verdict = f"All {disagree}/{total_checked} live signals checked run **against** the {bias_dir} analyst framework -- worth a closer look."
         else:
-            verdict = f"Live signals are split: {agree}/{total_signals} align with the {bias_dir} framework, {disagree}/{total_signals} run against it."
+            verdict = f"Live signals: {', '.join(parts)} with the {bias_dir} framework."
         lines.append(f"**Bottom line:** {verdict}")
 
     return lines
@@ -1189,7 +1346,8 @@ p_events, f_events = filter_calendar_for_pair(past_events, future_events, select
 snapshot = {}
 if p_events:
     latest = p_events[0]
-    snapshot["last_actual"] = f"{latest['country']} {latest['event']}: {latest['actual']}"
+    value = latest["actual"] if latest["actual"] is not None else latest.get("direction", "narrative update")
+    snapshot["last_actual"] = f"{latest['country']} {latest['event']}: {value}"
 if f_events:
     nxt = f_events[0]
     snapshot["next_event"] = f"{nxt['country']} {nxt['event']} @ {nxt['time']}"
@@ -1197,23 +1355,31 @@ changes = get_delta_baseline(selected_pair, snapshot)
 
 cal_col1, cal_col2 = st.columns(2)
 with cal_col1:
-    st.markdown("**Recent releases (actual vs. estimate)**")
+    st.markdown("**Recent releases & headlines**")
     if p_events:
-        for e in p_events[:5]:
-            surprise = ""
-            try:
-                if e["actual"] is not None and e["estimate"] is not None:
-                    diff = float(re.sub(r"[^\d\.\-+]", "", str(e["actual"]))) - float(re.sub(r"[^\d\.\-+]", "", str(e["estimate"])))
-                    surprise = " 🔺 beat" if diff > 0 else (" 🔻 miss" if diff < 0 else " ➖ in-line")
-            except Exception:
-                pass
-            est_part = f" vs est. {e['estimate']}" if e["estimate"] is not None else ""
-            st.markdown(
-                f"- `{e['time'].strftime('%Y-%m-%d')}` **{e['country']}** {e['event']}: "
-                f"actual **{e['actual']}**{est_part}{surprise}"
-            )
+        for e in p_events[:6]:
+            date_str = e["time"].strftime("%Y-%m-%d")
+            if e.get("impact") == "narrative":
+                dir_tag = {
+                    "Strengthening": " 🔺 currency strengthening",
+                    "Weakening": " 🔻 currency weakening",
+                }.get(e.get("direction"), " -- no clear directional read")
+                st.markdown(f"- `{date_str}` **{e['country']}** _{e['event']}_{dir_tag}")
+            else:
+                surprise = ""
+                try:
+                    if e["actual"] is not None and e["estimate"] is not None:
+                        diff = float(re.sub(r"[^\d\.\-+]", "", str(e["actual"]))) - float(re.sub(r"[^\d\.\-+]", "", str(e["estimate"])))
+                        surprise = " 🔺 beat" if diff > 0 else (" 🔻 miss" if diff < 0 else " ➖ in-line")
+                except Exception:
+                    pass
+                est_part = f" vs est. {e['estimate']}" if e["estimate"] is not None else ""
+                st.markdown(
+                    f"- `{date_str}` **{e['country']}** {e['event']}: "
+                    f"actual **{e['actual']}**{est_part}{surprise}"
+                )
     else:
-        st.caption("No recent high/medium-impact releases found for this pair's countries.")
+        st.caption("No recent high/medium-impact releases or currency-relevant headlines found for this pair.")
 with cal_col2:
     st.markdown("**Upcoming events (next binary risk)**")
     if f_events:
@@ -1242,11 +1408,20 @@ else:
     st.caption(
         f"Source: zero-key fallback -- 'Upcoming' is each relevant central bank's next "
         f"confirmed meeting date (published officially, reference table verified "
-        f"{CENTRAL_BANK_MEETING_DATES_VERIFIED_AS_OF}); 'Recent releases' are actual-vs-"
-        f"estimate figures extracted directly from the same RSS news feed used in News & "
-        f"Sentiment below, at no extra API cost. Add FINNHUB_API_KEY in Secrets for a "
-        f"fuller multi-event calendar (CPI, NFP, GDP, etc.) instead of just central bank dates."
+        f"{CENTRAL_BANK_MEETING_DATES_VERIFIED_AS_OF}); 'Recent' combines actual-vs-"
+        f"estimate figures AND currency-relevant narrative headlines (speeches, "
+        f"testimony, political-comment reactions) extracted from the same RSS feed "
+        f"used in News & Sentiment below, at no extra API cost -- narrative items are "
+        f"marked in italics with a strengthening/weakening tag where detectable. Add "
+        f"FINNHUB_API_KEY in Secrets for a fuller multi-event calendar (CPI, NFP, GDP, "
+        f"etc.) instead of just central bank dates."
     )
+st.caption(
+    f"⏱️ {freshness_badge(cal_fetched_at, warn_hours=1, stale_hours=6)} -- this tier is "
+    f"cached 30 min, so most auto-refresh ticks are re-showing this same snapshot rather "
+    f"than pulling new data every time."
+)
+
 
 st.write("---")
 
@@ -1305,9 +1480,9 @@ if ALPHAVANTAGE_API_KEY:
             "rather than auto-refreshing because the free Alpha Vantage tier is "
             "limited to 25 requests/day."
         )
-        articles, news_err, mode = [], None, None
+        articles, news_err, mode, news_fetched_at = [], None, None, None
     else:
-        articles, news_err, mode = st.session_state[news_key]
+        articles, news_err, mode, news_fetched_at = st.session_state[news_key]
 else:
     # Zero-key path: runs immediately, no button, no signup needed.
     st.caption(
@@ -1315,7 +1490,13 @@ else:
         "key configured). Add ALPHAVANTAGE_API_KEY in Secrets for real ML-scored "
         "sentiment instead of this word-counting heuristic."
     )
-    articles, news_err, mode = fetch_news_sentiment(selected_pair)
+    articles, news_err, mode, news_fetched_at = fetch_news_sentiment(selected_pair)
+
+if news_fetched_at:
+    st.caption(
+        f"⏱️ {freshness_badge(news_fetched_at, warn_hours=1, stale_hours=8)}"
+        + (" -- cached 30 min" if mode == "heuristic" else " -- cached 6h (Alpha Vantage quota)")
+    )
 
 if news_err:
     st.warning(news_err)
