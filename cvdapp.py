@@ -1005,6 +1005,7 @@ st.caption(
 
 tf_tabs = st.tabs(["30m", "1h", "4h", "1d"])
 all_cvd, all_errors = build_all_timeframe_cvd(td_symbol)
+cvd_summaries_by_tf = {}  # captured here for reuse in the fundamentals synthesis below
 
 for tf, tab in zip(TIMEFRAMES, tf_tabs):
     with tab:
@@ -1019,6 +1020,7 @@ for tf, tab in zip(TIMEFRAMES, tf_tabs):
             continue
 
         summary = summarize_cvd(d)
+        cvd_summaries_by_tf[tf] = summary
         if summary["volume_mode"] == "tick-direction proxy":
             st.caption(
                 "⚠️ This feed isn't reporting real trading volume for this pair right now, "
@@ -1041,9 +1043,144 @@ st.info(CROSS_CUTTING_THEME)
 
 m = MACRO_INTELLIGENCE_MATRIX[selected_pair]
 
+# Fetched once here and reused by both the synthesis box below and the Live
+# Economic Calendar tier further down -- st.cache_data makes the second call
+# free, this just keeps the data available where it's needed first.
+past_events, future_events, cal_err, cal_source = fetch_economic_calendar()
+p_events_syn, f_events_syn = filter_calendar_for_pair(past_events, future_events, selected_pair)
+
+# News input to the synthesis: safe to auto-fetch only when it costs nothing
+# (RSS/heuristic path). When Alpha Vantage is configured, only use it if the
+# user already clicked "Fetch latest headlines" this session -- auto-calling
+# it here would silently burn the 25/day quota on every page load.
+_news_key_syn = f"_news_{selected_pair}"
+if ALPHAVANTAGE_API_KEY:
+    syn_articles, syn_news_mode = (
+        st.session_state[_news_key_syn][0], st.session_state[_news_key_syn][2]
+    ) if _news_key_syn in st.session_state else ([], None)
+else:
+    syn_articles, _, syn_news_mode = fetch_news_sentiment(selected_pair)
+
+
+def synthesize_pair_view(pair, cal_past, cal_future, cvd_by_tf, news_articles, news_mode, bias_label):
+    """
+    Builds a live 'what this actually means right now' comment for the
+    selected pair from whatever data was actually fetched this run -- not a
+    canned narrative. Each line is only included if real data supports it,
+    and the closing line tallies how many of the live signals agree or
+    disagree with the static analyst bias above, rather than asserting a
+    verdict.
+    """
+    bias_dir = "Bullish" if "Bullish" in bias_label else ("Bearish" if "Bearish" in bias_label else None)
+    lines = []
+    agree, disagree, total_signals = 0, 0, 0
+
+    # Recent data-release surprises
+    beats = misses = inline = 0
+    for e in cal_past[:5]:
+        try:
+            if e["estimate"] is None:
+                continue
+            a = float(re.sub(r"[^\d.\-+]", "", str(e["actual"])))
+            b = float(re.sub(r"[^\d.\-+]", "", str(e["estimate"])))
+            if a > b:
+                beats += 1
+            elif a < b:
+                misses += 1
+            else:
+                inline += 1
+        except Exception:
+            continue
+    if beats or misses:
+        lean = "upside" if beats > misses else ("downside" if misses > beats else "mixed")
+        lines.append(
+            f"📊 Recent releases for this pair have leaned **{lean}** "
+            f"({beats} beat / {misses} miss / {inline} in-line, last {beats + misses + inline})."
+        )
+        if bias_dir:
+            total_signals += 1
+            data_dir = "Bullish" if lean == "upside" else ("Bearish" if lean == "downside" else None)
+            if data_dir == bias_dir:
+                agree += 1
+            elif data_dir:
+                disagree += 1
+
+    # Next scheduled risk event
+    if cal_future:
+        nxt = cal_future[0]
+        days_out = max((nxt["time"] - datetime.datetime.utcnow()).days, 0)
+        lines.append(f"📅 Next binary risk event: **{nxt['event']}** in {days_out}d.")
+
+    # News sentiment lean
+    if news_articles:
+        bullish_n = sum(1 for a in news_articles if "Bullish" in a["sentiment_label"])
+        bearish_n = sum(1 for a in news_articles if "Bearish" in a["sentiment_label"])
+        if bullish_n or bearish_n:
+            news_lean = "bullish" if bullish_n > bearish_n else ("bearish" if bearish_n > bullish_n else "mixed")
+            qualifier = "ML-scored" if news_mode == "ml" else "keyword-heuristic"
+            lines.append(
+                f"📰 News sentiment ({qualifier}) skews **{news_lean}** "
+                f"({bullish_n} bullish / {bearish_n} bearish of {len(news_articles)} headlines)."
+            )
+            if bias_dir:
+                total_signals += 1
+                news_dir = "Bullish" if news_lean == "bullish" else ("Bearish" if news_lean == "bearish" else None)
+                if news_dir == bias_dir:
+                    agree += 1
+                elif news_dir:
+                    disagree += 1
+    else:
+        lines.append(
+            "📰 No news sentiment included yet -- " + (
+                "click 'Fetch latest headlines' below to add it to this synthesis."
+                if ALPHAVANTAGE_API_KEY else "RSS feed returned nothing this cycle."
+            )
+        )
+
+    # CVD technical alignment across timeframes
+    tf_biases = {tf: s["bias"] for tf, s in cvd_by_tf.items() if s}
+    if tf_biases:
+        bull_tf = sum(1 for b in tf_biases.values() if "Bullish" in b)
+        bear_tf = sum(1 for b in tf_biases.values() if "Bearish" in b)
+        lines.append(
+            f"📈 Order-flow proxy (CVD) is bullish on {bull_tf}/{len(tf_biases)} timeframes "
+            f"and bearish on {bear_tf}/{len(tf_biases)}."
+        )
+        if bias_dir:
+            total_signals += 1
+            cvd_dir = "Bullish" if bull_tf > bear_tf else ("Bearish" if bear_tf > bull_tf else None)
+            if cvd_dir == bias_dir:
+                agree += 1
+            elif cvd_dir:
+                disagree += 1
+
+    if bias_dir and total_signals:
+        if disagree == 0:
+            verdict = f"All {agree}/{total_signals} live signals checked align with the **{bias_dir}** analyst framework."
+        elif agree == 0:
+            verdict = f"All {disagree}/{total_signals} live signals checked run **against** the {bias_dir} analyst framework -- worth a closer look."
+        else:
+            verdict = f"Live signals are split: {agree}/{total_signals} align with the {bias_dir} framework, {disagree}/{total_signals} run against it."
+        lines.append(f"**Bottom line:** {verdict}")
+
+    return lines
+
+
+st.markdown("### 🧠 What this means for " + selected_pair + " right now")
+synthesis_lines = synthesize_pair_view(
+    selected_pair, p_events_syn, f_events_syn, cvd_summaries_by_tf,
+    syn_articles, syn_news_mode, m["bias"],
+)
+for line in synthesis_lines:
+    st.markdown(f"- {line}")
+st.caption(
+    "Computed live from the data actually fetched this run (calendar, news, CVD) -- "
+    "not a canned summary. This is a descriptive tally of what the live signals show, "
+    "not a trading recommendation."
+)
+
 # --- Tier 1: live scheduled-data (economic calendar) ---
 st.markdown("### 📅 Live Economic Calendar")
-past_events, future_events, cal_err, cal_source = fetch_economic_calendar()
 if cal_err:
     st.warning(cal_err)
 
